@@ -20,9 +20,9 @@ fi
 # This checkout is deployment-only. Local development belongs elsewhere.
 as_rove git -C "$repo" checkout --force --detach "$revision"
 echo "Building $revision"
-as_rove /srv/rove/.cargo/bin/cargo build --release --locked --manifest-path "$repo/backend-rove/Cargo.toml" --bin backend-rove
+as_rove /srv/rove/.cargo/bin/cargo build --release --locked --manifest-path "$repo/backend-rove/Cargo.toml" --bin server
 install -d -m 755 /opt/rove/releases
-install -m 755 "$repo/backend-rove/target/release/backend-rove" "/opt/rove/releases/$revision"
+install -m 755 "$repo/backend-rove/target/release/server" "/opt/rove/releases/$revision"
 previous=$(readlink /opt/rove/current || true)
 ln -sfn "releases/$revision" /opt/rove/current.next
 mv -Tf /opt/rove/current.next /opt/rove/current
