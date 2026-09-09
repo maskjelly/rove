@@ -15,7 +15,7 @@ function notice(text = '', kind = 'error') {
   el.dataset.kind = kind;
 }
 function setState(text) {
-  const el = $('state'));
+  const el = $('state');
   el.textContent = text;
   el.dataset.phase = text;
 }
