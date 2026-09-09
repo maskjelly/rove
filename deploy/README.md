@@ -36,3 +36,12 @@ The backend must keep its `server` Cargo binary name and `/health` endpoint.
 Uncommitted code is never deployed. Push application code separately when ready.
 Changes to the deployment scripts/service require reinstalling them on the server;
 the workflow deploys application code only.
+
+## Public browser client
+
+The browser assets under `frontend-rove/` are embedded into the Rust executable,
+so they update and roll back with each backend deployment. Caddy serves
+https://45.196.196.251 and proxies to port 3000. `deploy/Caddyfile` is installed
+at `/etc/caddy/Caddyfile`; install changes there, validate with `caddy validate`,
+then `systemctl reload caddy`. Caddy automatically renews the short-lived
+Let’s Encrypt IP certificate. Both services are enabled at boot.

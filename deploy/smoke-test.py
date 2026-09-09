@@ -18,6 +18,15 @@ try:
             time.sleep(0.1)
     else:
         raise RuntimeError("Server did not become healthy")
+    for path, content_type, marker in [
+        ("/", "text/html", b'Talk. Watch it stream.'),
+        ("/app.css", "text/css", b'.workspace'),
+        ("/app.js", "text/javascript", b"fetch('/chat'"),
+        ("/stream.mjs", "text/javascript", b'export async function* readSse'),
+    ]:
+        with urllib.request.urlopen("http://127.0.0.1:3000" + path, timeout=2) as response:
+            assert response.headers.get_content_type() == content_type
+            assert marker in response.read()
     with urllib.request.urlopen("http://127.0.0.1:3000/events", timeout=12) as response:
         assert response.headers.get_content_type() == "text/event-stream"
         events = []

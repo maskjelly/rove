@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Talk to Rove and watch AI responses stream live, with response timing and raw SSE events.">
+  <meta name="theme-color" content="#111521">
+  <title>Rove — live AI streaming</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Rove home"><span class="mark">r</span> rove <span class="lab">STREAM LAB</span></a>
+    <button id="share" class="secondary">Copy link <span aria-hidden="true">↗</span></button>
+  </header>
+  <main>
+    <div class="intro"><div><p class="eyebrow">A RESPONSE, AS IT HAPPENS</p><h1>Talk. Watch it stream.</h1><p>Ask anything. See the answer arrive, one update at a time.</p></div><div class="connection"><span class="dot" id="connection-dot"></span><span id="connection">Connecting</span></div></div>
+    <div class="workspace">
+      <section class="chat-panel" aria-label="AI conversation">
+        <div class="panel-heading"><span><span class="mini-dot"></span> LIVE CHAT</span><button id="clear" class="text-button">New conversation ↺</button></div>
+        <div id="conversation" class="conversation">
+          <div id="welcome" class="welcome"><div class="wave" aria-hidden="true">▂ ▅ ▃ █ ▆ ▂ ▄</div><h2>Something on your mind?</h2><p>The server sends each update immediately.<br>You don’t have to wait for the full answer.</p><div class="suggestions"><button data-prompt="Explain SSE to me using a simple analogy.">Explain SSE simply ↗</button><button data-prompt="Tell me a short story about a robot learning to make coffee.">Tell me a short story ↗</button><button data-prompt="Why can the first AI token take longer than the rest? Keep it concise.">Why the initial wait? ↗</button></div></div>
+        </div>
+        <div id="notice" role="status" class="notice" hidden></div>
+        <form id="chat-form"><label class="sr-only" for="prompt">Message Rove</label><div class="composer"><textarea id="prompt" rows="2" maxlength="16000" placeholder="Ask Rove something…" required></textarea><button type="submit" id="send" aria-label="Send message">↑</button><button type="button" id="stop" hidden>Stop ■</button></div><div class="composer-note"><span>Enter to send · Shift + Enter for a new line</span><span>History stays in this tab</span></div></form>
+      </section>
+      <aside class="telemetry" aria-label="Live streaming measurements">
+        <div class="panel-heading"><span>THE LIVE READOUT</span><span id="state" class="state">READY</span></div>
+        <div class="stats"><div class="stat"><span>First answer</span><strong id="first">—</strong><small>Send → first answer text</small></div><div class="stat"><span>Total time</span><strong id="total">—</strong><small>Send → completion</small></div><div class="stat"><span>Text updates</span><strong id="updates">0</strong><small>Answer deltas received</small></div><div class="stat"><span>Average gap</span><strong id="gap">—</strong><small>Between answer updates</small></div></div>
+        <div class="signal"><div><span>Arrival rhythm</span><span id="signal-label">Waiting for a message</span></div><div id="rhythm" class="rhythm" aria-label="Recent gaps between answer updates"></div></div>
+        <div class="explanation"><span class="mini-dot"></span><p>These are browser-observed timings, including network travel and model generation. An update can contain more than one token.</p></div>
+        <details class="events" open><summary>Raw SSE events <span id="event-count">0</span></summary><pre id="raw" tabindex="0">Send a message to inspect its event stream.</pre></details>
+        <p class="footnote">Reasoning summaries appear when the model provides them. They aren’t the model’s private internal reasoning.</p>
+      </aside>
+    </div>
+    <footer><span>ROVE / STREAM LAB</span><span>OpenAI → server → your browser</span></footer>
+  </main>
+</body>
+</html>

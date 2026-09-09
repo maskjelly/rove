@@ -3,7 +3,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{StatusCode, header},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{Html, IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -42,11 +42,12 @@ async fn chat(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(request): Json<ChatRequest>,
 ) -> Response {
-    // SSH forwarding reaches this endpoint from loopback. Never trust forwarded headers.
+    // SSH and the public HTTPS reverse proxy connect from loopback.
+    // Direct plain-HTTP chat on port 3000 stays disabled; never trust forwarded headers.
     if !peer.ip().is_loopback() {
         return error(
             StatusCode::FORBIDDEN,
-            "Connect through the SSH tunnel (cargo run --bin client).",
+            "Open https://45.196.196.251 or connect through the SSH client.",
         );
     }
     let Some(key) = &state.key else {
@@ -76,7 +77,7 @@ async fn chat(
     let Ok(permit) = state.slots.clone().try_acquire_owned() else {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
-            "Two requests are already running. Try again shortly.",
+            "The server is busy. Try again shortly.",
         );
     };
     let input: Vec<_> = request
@@ -175,9 +176,40 @@ async fn main() {
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into())
                 .trim_end_matches('/')
         ),
-        slots: Arc::new(Semaphore::new(2)),
+        slots: Arc::new(Semaphore::new(8)),
     };
     let app = Router::new()
+        .route(
+            "/",
+            get(|| async { Html(include_str!("../../frontend-rove/index.html")) }),
+        )
+        .route(
+            "/app.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../../frontend-rove/app.css"),
+                )
+            }),
+        )
+        .route(
+            "/app.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../../frontend-rove/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/stream.mjs",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../../frontend-rove/stream.mjs"),
+                )
+            }),
+        )
         .route("/health", get(|| async { "ok" }))
         .route("/events", get(sse_event_handler))
         .route("/chat", post(chat))
