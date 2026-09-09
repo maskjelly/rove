@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec 9>/run/lock/rove-deploy.lock
+flock -w 1800 9
+requested=${1:-}
+[[ "$requested" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a commit SHA" >&2; exit 2; }
+export GIT_TERMINAL_PROMPT=0
+base=/srv/rove
+repo=$base/repository
+as_rove() { runuser -u rove -- "$@"; }
+if [[ ! -d "$repo/.git" ]]; then
+  as_rove git clone --branch main --single-branch https://github.com/maskjelly/rove.git "$repo"
+fi
+as_rove git -C "$repo" fetch --prune origin main
+revision=$(as_rove git -C "$repo" rev-parse origin/main)
+[[ "$revision" == "$requested" ]] || { echo "Superseded by a newer main commit; skipping $requested"; exit 0; }
+if [[ -f "$base/deployed-revision" ]] && [[ $(cat "$base/deployed-revision") == "$revision" ]]; then
+  exit 0
+fi
+# This checkout is deployment-only. Local development belongs elsewhere.
+as_rove git -C "$repo" checkout --force --detach "$revision"
+echo "Building $revision"
+as_rove /srv/rove/.cargo/bin/cargo build --release --locked --manifest-path "$repo/backend-rove/Cargo.toml" --bin backend-rove
+install -d -m 755 /opt/rove/releases
+install -m 755 "$repo/backend-rove/target/release/backend-rove" "/opt/rove/releases/$revision"
+previous=$(readlink /opt/rove/current || true)
+ln -sfn "releases/$revision" /opt/rove/current.next
+mv -Tf /opt/rove/current.next /opt/rove/current
+healthy=false
+if systemctl restart rove.service; then
+  for attempt in {1..30}; do
+    if systemctl is-active --quiet rove.service && [[ $(curl -fsS --max-time 2 http://127.0.0.1:3000/health || true) == ok ]]; then
+      healthy=true
+      break
+    fi
+    sleep 1
+  done
+fi
+if [[ "$healthy" != true ]]; then
+  echo "Deployment failed health check; restoring previous release" >&2
+  systemctl stop rove.service
+  if [[ -n "$previous" ]]; then
+    ln -sfn "$previous" /opt/rove/current.next
+    mv -Tf /opt/rove/current.next /opt/rove/current
+    systemctl start rove.service
+  fi
+  exit 1
+fi
+printf '%s\n' "$revision" > "$base/deployed-revision"
+echo "Deployed $revision successfully"
+# Retain the current and previous executable for recovery.
+for release in /opt/rove/releases/*; do
+  [[ "$release" == "/opt/rove/releases/$revision" || "$release" == "/opt/rove/$previous" ]] || rm -f -- "$release"
+done

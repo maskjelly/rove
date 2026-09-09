@@ -1,0 +1,24 @@
+[Unit]
+Description=Rove backend
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/opt/rove/current
+
+[Service]
+Type=simple
+User=rove
+Group=rove
+WorkingDirectory=/srv/rove
+EnvironmentFile=-/etc/rove.env
+ExecStart=/opt/rove/current
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

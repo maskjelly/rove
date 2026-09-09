@@ -1,0 +1,42 @@
+name: CI and deploy
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rove-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend-rove
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo test --locked --all-targets
+      - run: cargo build --release --locked --bin backend-rove
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: check
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy tested commit
+        env:
+          DEPLOY_KEY: ${{ secrets.ROVE_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.ROVE_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/rove_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/rove_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 root@45.196.196.251 "$GITHUB_SHA"
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/rove_deploy

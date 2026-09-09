@@ -1,0 +1,38 @@
+# Rove deployment
+
+Push to `main` in `maskjelly/rove` to trigger `.github/workflows/deploy.yml`.
+GitHub runs locked Rust tests for all targets and builds `backend-rove`. On success,
+a restricted SSH key asks `ssh rove` to build and deploy that same commit.
+The server rejects stale commits when main has advanced. PRs run checks only.
+
+The server builds before stopping the old service. systemd stops the entire old
+process group, starts the new executable, and restarts it after crashes/reboots.
+Deployment requires `GET http://127.0.0.1:3000/health` to return `ok`; failure restores
+the previous executable. There is a brief interruption during replacement.
+No polling or GitHub webhook listener is installed.
+
+GitHub secrets: `ROVE_DEPLOY_KEY`, `ROVE_KNOWN_HOSTS`.
+The key only permits deployment commands, not an interactive root shell.
+Builds and the backend run as the `rove` user.
+
+Server paths:
+- `/usr/local/sbin/rove-deploy`: deployment script
+- `/usr/local/sbin/rove-deploy-ssh`: restricted SSH entry point
+- `/etc/systemd/system/rove.service`: runtime service
+- `/srv/rove/repository`: dedicated build checkout (never edit here)
+- `/srv/rove/deployed-revision`: last healthy commit
+- `/opt/rove/current`: active executable symlink
+- `/opt/rove/releases`: current and previous executable
+- `/etc/rove.env`: optional environment variables
+
+Commands:
+```sh
+ssh rove 'systemctl status rove --no-pager'
+ssh rove 'journalctl -u rove -n 100 --no-pager'
+ssh rove 'journalctl -u "rove-deploy-*" -n 100 --no-pager'
+```
+
+The backend must keep its `backend-rove` Cargo binary name and `/health` endpoint.
+Uncommitted code is never deployed. Push application code separately when ready.
+Changes to the deployment scripts/service require reinstalling them on the server;
+the workflow deploys application code only.

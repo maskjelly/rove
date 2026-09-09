@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+revision=${SSH_ORIGINAL_COMMAND:-}
+[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo 'Only commit deployment commands are allowed' >&2; exit 2; }
+# systemd keeps the deployment alive if the SSH connection is interrupted.
+exec systemd-run --quiet --wait --pipe --collect --unit="rove-deploy-$revision-$(date +%s)" /usr/local/sbin/rove-deploy "$revision"
