@@ -8,9 +8,16 @@ let history = [];
 let controller = null;
 const welcome = $('welcome');
 
-function notice(text = '') {
-  $('notice').textContent = text;
-  $('notice').hidden = !text;
+function notice(text = '', kind = 'error') {
+  const el = $('notice');
+  el.textContent = text;
+  el.hidden = !text;
+  el.dataset.kind = kind;
+}
+function setState(text) {
+  const el = $('state'));
+  el.textContent = text;
+  el.dataset.phase = text;
 }
 function scrollConversation() {
   const container = $('conversation');
@@ -58,6 +65,7 @@ $('chat-form').addEventListener('submit', async (event) => {
   notice();
   welcome.remove();
   $('prompt').value = '';
+  $('prompt').style.height = 'auto';
   message('you', prompt);
   const reply = message('ai');
   reply.item.classList.add('streaming');
@@ -74,14 +82,14 @@ $('chat-form').addEventListener('submit', async (event) => {
   const input = [...history, { role: 'user', content: prompt }];
   while (input.length > 21 || input.reduce((n, m) => n + byteLength(m.content), 0) > 24_000) {
     input.splice(0, 2);
-    notice('Older turns were omitted to keep the conversation manageable.');
+    notice('Older turns were omitted to keep the conversation manageable.', 'info');
   }
   controller = new AbortController();
   $('send').hidden = true;
   $('stop').hidden = false;
   $('clear').disabled = true;
   $('prompt').disabled = true;
-  $('state').textContent = 'CONNECTING';
+  setState('CONNECTING');
   resetStats();
   const started = performance.now();
   const timing = new Timings(started);
@@ -113,18 +121,18 @@ $('chat-form').addEventListener('submit', async (event) => {
       if (nearBottom) $('raw').scrollTop = $('raw').scrollHeight;
       switch (item.type) {
         case 'response.created':
-          $('state').textContent = 'GENERATING';
+          setState('GENERATING');
           reply.item.querySelector('h3').textContent = item.response?.model || 'ROVE';
           break;
         case 'response.reasoning_summary_text.delta':
-          $('state').textContent = 'REASONING';
+          setState('REASONING');
           if (summary.hidden) { summary.hidden = false; summary.open = true; }
           summaryText.textContent += item.delta || '';
           break;
         case 'response.output_text.delta':
         case 'response.refusal.delta':
           if (!item.delta) break;
-          $('state').textContent = 'STREAMING';
+          setState('STREAMING');
           answer += item.delta;
           reply.answer.textContent = answer;
           timing.add(now);
@@ -132,7 +140,7 @@ $('chat-form').addEventListener('submit', async (event) => {
           break;
         case 'response.completed': {
           completed = true;
-          $('state').textContent = 'COMPLETE';
+          setState('COMPLETE');
           const usage = document.createElement('div');
           usage.className = 'usage';
           const tokens = item.response?.usage;
@@ -154,10 +162,10 @@ $('chat-form').addEventListener('submit', async (event) => {
     if (!completed) throw new Error('The connection ended early. Please try again.');
     if (!answer) throw new Error('No answer was returned. Please try a shorter question.');
     history = [...input, { role: 'assistant', content: answer }];
-    notice('Response complete. Ask a follow-up or start a new conversation.');
+    notice('Response complete. Ask a follow-up or start a new conversation.', 'ok');
   } catch (error) {
     const stopped = controller.signal.aborted;
-    $('state').textContent = stopped ? 'STOPPED' : 'ERROR';
+    setState(stopped ? 'STOPPED' : 'ERROR');
     const text = stopped ? (controller.signal.reason === 'timeout' ? 'The request timed out. Please try again.' : 'Stopped. Partial output was not saved to conversation history.') : error.message;
     notice(text);
     if (!answer) reply.answer.textContent = stopped ? 'Response stopped.' : 'Could not complete this response.';
@@ -184,9 +192,10 @@ $('clear').addEventListener('click', () => {
   history = [];
   $('conversation').replaceChildren(welcome);
   $('prompt').value = '';
+  $('prompt').style.height = 'auto';
   resetStats();
   $('raw').textContent = 'Send a message to inspect its event stream.';
-  $('state').textContent = 'READY';
+  setState('READY');
   $('signal-label').textContent = 'Waiting for a message';
   notice();
   $('prompt').focus();
@@ -196,6 +205,11 @@ $('prompt').addEventListener('keydown', (event) => {
     event.preventDefault();
     $('chat-form').requestSubmit();
   }
+});
+$('prompt').addEventListener('input', () => {
+  const box = $('prompt');
+  box.style.height = 'auto';
+  box.style.height = Math.min(150, box.scrollHeight) + 'px';
 });
 document.querySelectorAll('[data-prompt]').forEach((button) => button.addEventListener('click', () => {
   $('prompt').value = button.dataset.prompt;
@@ -215,7 +229,14 @@ let recording = false;
 let player = null;
 let spaceHeld = false;
 
-function setMicLabel(text) { const mic = $('mic'); if (mic) { mic.textContent = text; mic.classList.toggle('live', recording); } }
+function setMicLabel(text) {
+  const mic = $('mic');
+  if (!mic) return;
+  mic.textContent = text;
+  mic.classList.toggle('live', recording);
+  mic.setAttribute('aria-pressed', recording ? 'true' : 'false');
+  mic.title = recording ? 'Release to send' : 'Hold Space or hold this button to talk';
+}
 
 async function startRecording() {
   if (recording || controller) return;
@@ -237,7 +258,7 @@ async function startRecording() {
     player?.stop();
     recording = true;
     setMicLabel('●');
-    notice('Recording… release to send. Server will transcribe, think, and speak back.');
+    notice('Recording… release to send. Server will transcribe, think, and speak back.', 'info');
     recorder.start();
   } catch { notice('Microphone blocked. Allow access and try again.'); }
 }
@@ -277,7 +298,7 @@ async function runVoice(blob) {
   $('clear').disabled = true;
   $('prompt').disabled = true;
   $('mic').disabled = true;
-  $('state').textContent = 'LISTENING';
+  setState('LISTENING');
   resetStats();
   const started = performance.now();
   const wall = new VoiceTimings(started);
@@ -321,7 +342,7 @@ async function runVoice(blob) {
             reply.item.querySelector('h3').textContent = 'ROVE · ' + (models.chat || 'voice');
             break;
           case 'voice.stage':
-            $('state').textContent = 'TRANSCRIBING';
+            setState('TRANSCRIBING');
             break;
           case 'voice.transcript.delta':
             transcript += item.delta || '';
@@ -332,20 +353,20 @@ async function runVoice(blob) {
             serverAt.asr = item.asr_ms ?? null;
             transcript = item.text || transcript;
             userBubble.answer.textContent = transcript;
-            $('state').textContent = 'GENERATING';
+            setState('GENERATING');
             reply.answer.textContent = 'Thinking… first words play as soon as they stream.';
             break;
           case 'voice.llm_first':
             serverAt.llm = item.server_ms ?? null;
             break;
           case 'response.created':
-            $('state').textContent = 'GENERATING';
+            setState('GENERATING');
             llmModel = item.response?.model || '';
             if (llmModel) models.chat = llmModel;
             reply.item.querySelector('h3').textContent = llmModel || 'ROVE';
             break;
           case 'response.reasoning_summary_text.delta':
-            $('state').textContent = 'REASONING';
+            setState('REASONING');
             if (summary.hidden) { summary.hidden = false; summary.open = true; }
             summaryText.textContent += item.delta || '';
             break;
@@ -353,7 +374,7 @@ async function runVoice(blob) {
           case 'response.refusal.delta':
             if (!item.delta) break;
             wall.mark('text', now);
-            $('state').textContent = 'STREAMING';
+            setState('STREAMING');
             if (!answer) reply.answer.textContent = '';
             answer += item.delta;
             reply.answer.textContent = answer;
@@ -364,7 +385,7 @@ async function runVoice(blob) {
             wall.mark('audio', now);
             serverAt.audio = item.server_ms ?? serverAt.audio;
             serverMs = item.server_ms ?? serverMs;
-            $('state').textContent = 'SPEAKING';
+            setState('SPEAKING');
             break;
           case 'voice.tts.request':
             ttsRequests.push({ segment: item.segment ?? ttsRequests.length, chars: item.chars ?? 0, at: now - started, serverMs: item.server_ms ?? null });
@@ -406,7 +427,7 @@ async function runVoice(blob) {
             counts.ttsChars = item.tts_chars ?? counts.ttsChars;
             counts.ttsSegments = item.tts_segments ?? counts.ttsSegments;
             counts.audioBytes = item.audio_bytes ?? counts.audioBytes;
-            $('state').textContent = 'COMPLETE';
+            setState('COMPLETE');
             break;
           case 'response.incomplete':
             throw new Error('The response reached its output limit. Try a shorter recording.');
@@ -423,31 +444,40 @@ async function runVoice(blob) {
     if (!answer) throw new Error('No answer was returned. Please try again.');
     const fmt = (ms) => ms === null || ms === undefined ? '—' : formatTime(ms);
     const audioSec = counts.audioBytes ? (counts.audioBytes / 2 / models.rate) : 0;
+    const esc = (text) => String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
     const card = document.createElement('div');
     card.className = 'voice-analytics';
     const total = wall.total || 1;
     const row = (label, clientMs, serverMsValue) => {
       const pct = clientMs === null ? 0 : Math.min(100, (clientMs / total) * 100);
-      return `<div class="pipe"><span>${label}</span><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div><b>${fmt(clientMs)}${serverMsValue !== null && serverMsValue !== undefined ? ' · srv ' + fmt(serverMsValue) : ''}</b></div>`;
+      const srv = serverMsValue !== null && serverMsValue !== undefined ? ` <small>srv ${fmt(serverMsValue)}</small>` : '';
+      return `<div class="pipe"><span>${label}</span><b>${fmt(clientMs)}${srv}</b><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div></div>`;
     };
+    const stat = (label, value) => `<div>${label} <b>${value}</b></div>`;
     card.innerHTML =
       `<div class="va-title">PIPELINE ANALYTICS</div>` +
-      `<div class="va-models">ASR <b>${models.asr}</b> → chat <b>${models.chat}</b> → TTS <b>${models.tts}${models.voice ? '/' + models.voice : ''}</b> @ ${(models.rate / 1000).toFixed(0)}kHz</div>` +
-      row('Send → transcribed (speech→text)', wall.asr, serverAt.asr) +
-      row('Send → first words (LLM TTFT)', wall.firstText, serverAt.llm) +
-      row('Send → first audio (TTS)', wall.firstAudio, serverAt.audio) +
-      row('Send → done (all audio)', wall.total, serverAt.done ?? serverMs) +
-      `<div class="va-stats">upload ${(counts.upload / 1024).toFixed(1)} KB · transcript ${transcript.length} chars · answer ${answer.length} chars` +
-      `${counts.inTokens !== null ? ` · ${counts.inTokens} in / ${counts.outTokens} out tokens` : ''}` +
-      ` · TTS ${counts.ttsSegments} sentences / ${counts.ttsChars} chars · audio ${wall.audioChunks} chunks / ${(counts.audioBytes / 1024).toFixed(1)} KB ≈ ${audioSec.toFixed(1)}s · ${textGap.updates} text updates</div>` +
-      `<div class="va-note">Server did ASR + AI + TTS. This device only recorded and played. Client times include network; srv = server stopwatch.</div>`;
+      `<div class="va-models"><span class="chip">${esc(models.asr)}</span><span class="chip arrow">→</span><span class="chip">${esc(models.chat)}</span><span class="chip arrow">→</span><span class="chip voice">${esc(models.tts)}${models.voice ? ' · ' + esc(models.voice) : ''} · ${(models.rate / 1000).toFixed(0)}kHz</span></div>` +
+      row('Transcribed · speech to text', wall.asr, serverAt.asr) +
+      row('First words · LLM answer starts', wall.firstText, serverAt.llm) +
+      row('First audio · TTS speaks', wall.firstAudio, serverAt.audio) +
+      row('Done · all audio played', wall.total, serverAt.done ?? serverMs) +
+      `<div class="va-stats">` +
+      stat('Upload', (counts.upload / 1024).toFixed(1) + ' KB') +
+      stat('Heard', transcript.length + ' chars') +
+      stat('Answer', answer.length + ' chars') +
+      (counts.inTokens !== null ? stat('Tokens', counts.inTokens + ' in / ' + counts.outTokens + ' out') : '') +
+      stat('Speech', counts.ttsSegments + ' sentences / ' + counts.ttsChars + ' chars') +
+      stat('Audio', wall.audioChunks + ' chunks / ' + (counts.audioBytes / 1024).toFixed(1) + ' KB ≈ ' + audioSec.toFixed(1) + 's') +
+      stat('Text updates', textGap.updates) +
+      `</div>` +
+      `<div class="va-note">Server did ASR + AI + TTS. This device only recorded and played. Big times include network; srv = server stopwatch.</div>`;
     reply.item.append(card);
     history = [...input, { role: 'user', content: transcript }, { role: 'assistant', content: answer }];
-    notice('Voice reply complete. Ask a follow-up by voice or text.');
+    notice('Voice reply complete. Ask a follow-up by voice or text.', 'ok');
   } catch (error) {
     player?.stop();
     const stopped = controller?.signal.aborted;
-    $('state').textContent = stopped ? 'STOPPED' : 'ERROR';
+    setState(stopped ? 'STOPPED' : 'ERROR');
     notice(stopped ? 'Stopped. Partial voice output was not saved.' : error.message);
     if (!answer) reply.answer.textContent = stopped ? 'Voice stopped.' : 'Could not complete this voice reply.';
     if (!transcript) userBubble.answer.textContent = '🎙 (no speech captured)';
