@@ -32,13 +32,20 @@ export async function* readSse(stream) {
 }
 
 export class Timings {
-  constructor(start) { this.start = start; this.first = null; this.last = null; this.updates = 0; this.gaps = []; }
+  constructor(start) { this.start = start; this.first = null; this.last = null; this.updates = 0; this.gapSum = 0; this.gapCount = 0; this.gaps = []; }
   add(now) {
     if (this.first === null) this.first = now;
-    if (this.last !== null) this.gaps.push(now - this.last);
+    if (this.last !== null) {
+      const gap = now - this.last;
+      this.gapSum += gap;
+      this.gapCount++;
+      // Kept for the rhythm visual (capped); the average uses the running sum.
+      this.gaps.push(gap);
+      if (this.gaps.length > 48) this.gaps.shift();
+    }
     this.last = now;
     this.updates++;
   }
   get firstAnswer() { return this.first === null ? null : this.first - this.start; }
-  get averageGap() { return this.gaps.length ? this.gaps.reduce((a, b) => a + b, 0) / this.gaps.length : null; }
+  get averageGap() { return this.gapCount ? this.gapSum / this.gapCount : null; }
 }

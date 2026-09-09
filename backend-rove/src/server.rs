@@ -1,3 +1,4 @@
+mod sessions;
 mod voice;
 use axum::{
     Json, Router,
@@ -10,7 +11,7 @@ use axum::{
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio_stream::{Stream, StreamExt, wrappers::IntervalStream};
 
@@ -21,6 +22,7 @@ struct AppState {
     model: String,
     endpoint: String,
     slots: Arc<Semaphore>,
+    sessions: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -76,10 +78,14 @@ async fn chat(
         );
     }
     let Ok(permit) = state.slots.clone().try_acquire_owned() else {
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "The server is busy. Try again shortly.",
-        );
+        return (
+            [(header::RETRY_AFTER, "2")],
+            error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "The server is busy. Try again shortly.",
+            ),
+        )
+            .into_response();
     };
     let input: Vec<_> = request
         .messages
@@ -126,14 +132,22 @@ async fn chat(
     let stream = async_stream::stream! {
         // Held until completion or client disconnect; dropping this stream closes upstream.
         let _permit = permit;
+        // Idle keep-alive: without traffic, NATs and middleboxes can kill a
+        // slow reasoning stream before the first token arrives.
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
         loop {
-            match upstream.chunk().await {
-                Ok(Some(bytes)) => yield Ok::<_, Infallible>(bytes),
-                Ok(None) => break,
-                Err(_) => {
-                    yield Ok(axum::body::Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"message\":\"Upstream stream interrupted; please retry.\"}\n\n"));
-                    break;
-                }
+            tokio::select! {
+                _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
+                chunk = upstream.chunk() => match chunk {
+                    Ok(Some(bytes)) => yield Ok(bytes),
+                    Ok(None) => break,
+                    Err(_) => {
+                        yield Ok(axum::body::Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"message\":\"Upstream stream interrupted; please retry.\"}\n\n"));
+                        break;
+                    }
+                },
             }
         }
     };
@@ -165,29 +179,38 @@ async fn sse_event_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>
 /// stamped with a hash of the bundle at startup. HTML is served `no-store`
 /// so browsers always pick up the newest asset URLs; the hashed JS/CSS
 /// URLs are `immutable` and safe to cache forever.
+/// FNV-1a 64-bit: stable across restarts (unlike DefaultHasher), so the
+/// immutable asset URLs only change when the bytes actually change.
+fn content_hash(parts: &[&str]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for part in parts {
+        for b in part.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn frontend_app(state: AppState) -> Router {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let raw_html = include_str!("../../frontend-rove/index.html");
     let raw_css = include_str!("../../frontend-rove/app.css");
     let raw_js = include_str!("../../frontend-rove/app.js");
     let raw_boot = include_str!("../../frontend-rove/boot.js");
     let raw_stream = include_str!("../../frontend-rove/stream.mjs");
     let raw_voice = include_str!("../../frontend-rove/voice.mjs");
-    let mut hasher = DefaultHasher::new();
-    raw_html.hash(&mut hasher);
-    raw_css.hash(&mut hasher);
-    raw_js.hash(&mut hasher);
-    raw_boot.hash(&mut hasher);
-    raw_stream.hash(&mut hasher);
-    raw_voice.hash(&mut hasher);
-    let hash = format!("{:016x}", hasher.finish());
-    let html = Html(raw_html.replace("{{ASSET_HASH}}", &hash));
-    let js: &'static str = Box::leak(raw_js.replace("{{ASSET_HASH}}", &hash).into_boxed_str());
+    let hash = content_hash(&[raw_html, raw_css, raw_js, raw_boot, raw_stream, raw_voice]);
+    let stamped = |raw: &str| raw.replace("{{ASSET_HASH}}", &hash);
+    let html = Html(stamped(raw_html));
+    // Owned because the {{ASSET_HASH}} stamp differs per build; leaked once,
+    // served forever. Plain files stay zero-copy.
+    let js: &'static str = Box::leak(stamped(raw_js).into_boxed_str());
+    let voice: &'static str = Box::leak(stamped(raw_voice).into_boxed_str());
     let css: &'static str = raw_css;
     let boot: &'static str = raw_boot;
     let stream: &'static str = raw_stream;
-    let voice: &'static str = raw_voice;
     let asset = |content_type: &'static str, body: &'static str| {
         (
             [
@@ -236,6 +259,7 @@ fn frontend_app(state: AppState) -> Router {
             post(chat).layer(DefaultBodyLimit::max(128 * 1024)),
         )
         .route("/voice", post(voice::voice).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
+        .route("/session/{id}", get(sessions::get))
         .route(
             "/voice.mjs",
             get(move || async move { asset("text/javascript; charset=utf-8", voice) }),
@@ -263,6 +287,9 @@ async fn main() {
                 .trim_end_matches('/')
         ),
         slots: Arc::new(Semaphore::new(8)),
+        sessions: std::env::var("ROVE_SESSIONS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("sessions")),
     };
     let app = frontend_app(state);
     let addr = std::env::var("ROVE_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());

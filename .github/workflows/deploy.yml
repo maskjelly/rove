@@ -27,6 +27,8 @@ jobs:
         run: node --test ../deploy/web-client.test.mjs
       - name: Verify AI streaming and errors without API credits
         run: python3 ../deploy/test-chat.py target/release/server target/release/client
+      - name: Verify voice pipeline, sessions and resume without API credits
+        run: python3 ../deploy/test-voice.py target/release/server
   deploy:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: check

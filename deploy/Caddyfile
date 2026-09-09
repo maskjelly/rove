@@ -12,5 +12,8 @@ https://45.196.196.251 {
         Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     }
     # Caddy flushes text/event-stream immediately by default. Do not buffer SSE.
-    reverse_proxy 127.0.0.1:3000
+    encode gzip zstd
+    reverse_proxy 127.0.0.1:3000 {
+        flush_interval -1
+    }
 }
