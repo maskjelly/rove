@@ -515,8 +515,12 @@ window.addEventListener('keyup', (event) => {
   if (recording) { event.preventDefault(); stopRecording(); }
 });
 
-fetch('/health', { cache: 'no-store' }).then((r) => {
+window.__roveBoot = true;
+const healthCheck = new AbortController();
+const healthTimer = setTimeout(() => healthCheck.abort(), 8000);
+fetch('/health', { cache: 'no-store', signal: healthCheck.signal }).then((r) => {
   if (!r.ok) throw new Error();
   $('connection').textContent = 'Server online';
   $('connection-dot').classList.add('connected');
-}).catch(() => { $('connection').textContent = 'Server unreachable'; });
+}).catch(() => { $('connection').textContent = 'Server unreachable'; })
+  .finally(() => clearTimeout(healthTimer));

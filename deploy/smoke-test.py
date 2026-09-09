@@ -22,6 +22,7 @@ try:
         ("/", "text/html", b'Talk. Watch it stream.'),
         ("/app.css", "text/css", b'.workspace'),
         ("/app.js", "text/javascript", b"fetch('/chat'"),
+        ("/boot.js", "text/javascript", b'__roveBoot'),
         ("/stream.mjs", "text/javascript", b'export async function* readSse'),
         ("/voice.mjs", "text/javascript", b'postVoice'),
     ]:

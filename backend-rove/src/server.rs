@@ -171,18 +171,21 @@ fn frontend_app(state: AppState) -> Router {
     let raw_html = include_str!("../../frontend-rove/index.html");
     let raw_css = include_str!("../../frontend-rove/app.css");
     let raw_js = include_str!("../../frontend-rove/app.js");
+    let raw_boot = include_str!("../../frontend-rove/boot.js");
     let raw_stream = include_str!("../../frontend-rove/stream.mjs");
     let raw_voice = include_str!("../../frontend-rove/voice.mjs");
     let mut hasher = DefaultHasher::new();
     raw_html.hash(&mut hasher);
     raw_css.hash(&mut hasher);
     raw_js.hash(&mut hasher);
+    raw_boot.hash(&mut hasher);
     raw_stream.hash(&mut hasher);
     raw_voice.hash(&mut hasher);
     let hash = format!("{:016x}", hasher.finish());
     let html = Html(raw_html.replace("{{ASSET_HASH}}", &hash));
     let js: &'static str = Box::leak(raw_js.replace("{{ASSET_HASH}}", &hash).into_boxed_str());
     let css: &'static str = raw_css;
+    let boot: &'static str = raw_boot;
     let stream: &'static str = raw_stream;
     let voice: &'static str = raw_voice;
     let asset = |content_type: &'static str, body: &'static str| {
@@ -217,6 +220,10 @@ fn frontend_app(state: AppState) -> Router {
         .route(
             "/app.js",
             get(move || async move { asset("text/javascript; charset=utf-8", js) }),
+        )
+        .route(
+            "/boot.js",
+            get(move || async move { asset("text/javascript; charset=utf-8", boot) }),
         )
         .route(
             "/stream.mjs",
