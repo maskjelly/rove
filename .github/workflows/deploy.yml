@@ -20,9 +20,11 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - run: cargo test --locked --all-targets
-      - run: cargo build --release --locked --bin server
+      - run: cargo build --release --locked --bin server --bin client
       - name: Verify health and event stream
         run: python3 ../deploy/smoke-test.py target/release/server
+      - name: Verify AI streaming and errors without API credits
+        run: python3 ../deploy/test-chat.py target/release/server target/release/client
   deploy:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: check
