@@ -23,6 +23,7 @@ try:
         ("/app.css", "text/css", b'.workspace'),
         ("/app.js", "text/javascript", b"fetch('/chat'"),
         ("/stream.mjs", "text/javascript", b'export async function* readSse'),
+        ("/voice.mjs", "text/javascript", b'postVoice'),
     ]:
         with urllib.request.urlopen("http://127.0.0.1:3000" + path, timeout=2) as response:
             assert response.headers.get_content_type() == content_type

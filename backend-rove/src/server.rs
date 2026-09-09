@@ -1,3 +1,4 @@
+mod voice;
 use axum::{
     Json, Router,
     body::Body,
@@ -212,8 +213,13 @@ async fn main() {
         )
         .route("/health", get(|| async { "ok" }))
         .route("/events", get(sse_event_handler))
-        .route("/chat", post(chat))
-        .layer(DefaultBodyLimit::max(128 * 1024))
+        .route(
+            "/chat",
+            post(chat).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route("/voice", post(voice::voice).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
+        .route("/voice.mjs", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../../frontend-rove/voice.mjs")) }))
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state);
     let addr = std::env::var("ROVE_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
     let listener = tokio::net::TcpListener::bind(&addr)
