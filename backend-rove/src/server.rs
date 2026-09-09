@@ -159,6 +159,84 @@ async fn sse_event_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>
         .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(5)))
 }
 
+/// Frontend bundle with content-hash cache busting.
+///
+/// `index.html` and `app.js` carry a `{{ASSET_HASH}}` placeholder that is
+/// stamped with a hash of the bundle at startup. HTML is served `no-store`
+/// so browsers always pick up the newest asset URLs; the hashed JS/CSS
+/// URLs are `immutable` and safe to cache forever.
+fn frontend_app(state: AppState) -> Router {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let raw_html = include_str!("../../frontend-rove/index.html");
+    let raw_css = include_str!("../../frontend-rove/app.css");
+    let raw_js = include_str!("../../frontend-rove/app.js");
+    let raw_stream = include_str!("../../frontend-rove/stream.mjs");
+    let raw_voice = include_str!("../../frontend-rove/voice.mjs");
+    let mut hasher = DefaultHasher::new();
+    raw_html.hash(&mut hasher);
+    raw_css.hash(&mut hasher);
+    raw_js.hash(&mut hasher);
+    raw_stream.hash(&mut hasher);
+    raw_voice.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+    let html = Html(raw_html.replace("{{ASSET_HASH}}", &hash));
+    let js: &'static str = Box::leak(raw_js.replace("{{ASSET_HASH}}", &hash).into_boxed_str());
+    let css: &'static str = raw_css;
+    let stream: &'static str = raw_stream;
+    let voice: &'static str = raw_voice;
+    let asset = |content_type: &'static str, body: &'static str| {
+        (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ),
+            ],
+            body,
+        )
+    };
+    Router::new()
+        .route(
+            "/",
+            get(move || {
+                let html = html.clone();
+                async move {
+                    (
+                        [(header::CACHE_CONTROL, "no-store")],
+                        html,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/app.css",
+            get(move || async move { asset("text/css; charset=utf-8", css) }),
+        )
+        .route(
+            "/app.js",
+            get(move || async move { asset("text/javascript; charset=utf-8", js) }),
+        )
+        .route(
+            "/stream.mjs",
+            get(move || async move { asset("text/javascript; charset=utf-8", stream) }),
+        )
+        .route("/health", get(|| async { "ok" }))
+        .route("/events", get(sse_event_handler))
+        .route(
+            "/chat",
+            post(chat).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route("/voice", post(voice::voice).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
+        .route(
+            "/voice.mjs",
+            get(move || async move { asset("text/javascript; charset=utf-8", voice) }),
+        )
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     let state = AppState {
@@ -179,48 +257,7 @@ async fn main() {
         ),
         slots: Arc::new(Semaphore::new(8)),
     };
-    let app = Router::new()
-        .route(
-            "/",
-            get(|| async { Html(include_str!("../../frontend-rove/index.html")) }),
-        )
-        .route(
-            "/app.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../../frontend-rove/app.css"),
-                )
-            }),
-        )
-        .route(
-            "/app.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../../frontend-rove/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/stream.mjs",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../../frontend-rove/stream.mjs"),
-                )
-            }),
-        )
-        .route("/health", get(|| async { "ok" }))
-        .route("/events", get(sse_event_handler))
-        .route(
-            "/chat",
-            post(chat).layer(DefaultBodyLimit::max(128 * 1024)),
-        )
-        .route("/voice", post(voice::voice).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
-        .route("/voice.mjs", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../../frontend-rove/voice.mjs")) }))
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
-        .with_state(state);
+    let app = frontend_app(state);
     let addr = std::env::var("ROVE_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

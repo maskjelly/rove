@@ -1,5 +1,5 @@
-import { readSse, Timings } from './stream.mjs';
-import { pickMime, createPcmPlayer, postVoice, VoiceTimings } from './voice.mjs';
+import { readSse, Timings } from './stream.mjs?v={{ASSET_HASH}}';
+import { pickMime, createPcmPlayer, postVoice, VoiceTimings } from './voice.mjs?v={{ASSET_HASH}}';
 
 const $ = (id) => document.getElementById(id);
 const byteLength = (text) => new TextEncoder().encode(text).length;
