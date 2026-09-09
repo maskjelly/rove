@@ -136,7 +136,9 @@ $('chat-form').addEventListener('submit', async (event) => {
           const usage = document.createElement('div');
           usage.className = 'usage';
           const tokens = item.response?.usage;
-          if (tokens) usage.textContent = tokens.input_tokens + ' input · ' + tokens.output_tokens + ' output tokens (including reasoning)';
+          const model = item.response?.model ? ' · ' + item.response.model : '';
+          if (tokens) usage.textContent = tokens.input_tokens + ' input · ' + tokens.output_tokens + ' output tokens (including reasoning) · ' + answer.length + ' chars' + model;
+          else usage.textContent = 'Response complete · ' + answer.length + ' chars' + model;
           reply.item.append(usage);
           break;
         }
@@ -286,6 +288,11 @@ async function runVoice(blob) {
   let answer = '';
   let completed = false;
   let serverMs = null;
+  const models = { asr: '—', chat: '—', tts: '—', voice: '', rate: 24000 };
+  const serverAt = { asr: null, llm: null, audio: null, done: null };
+  const counts = { upload: blob.size, audioBytes: 0, ttsChars: 0, ttsSegments: 0, inTokens: null, outTokens: null };
+  const ttsRequests = [];
+  let llmModel = '';
   let eventCount = 0;
   let rawEntries = [];
   const pushRaw = (item, now) => {
@@ -304,6 +311,15 @@ async function runVoice(blob) {
         const now = performance.now();
         pushRaw(item, now);
         switch (item.type) {
+          case 'voice.started':
+            models.asr = item.asr_model || models.asr;
+            models.chat = item.chat_model || models.chat;
+            models.tts = item.tts_model || models.tts;
+            models.voice = item.tts_voice || models.voice;
+            models.rate = item.tts_sample_rate || 24000;
+            counts.upload = item.upload_bytes ?? counts.upload;
+            reply.item.querySelector('h3').textContent = 'ROVE · ' + (models.chat || 'voice');
+            break;
           case 'voice.stage':
             $('state').textContent = 'TRANSCRIBING';
             break;
@@ -313,14 +329,20 @@ async function runVoice(blob) {
             break;
           case 'voice.transcribed':
             wall.mark('transcribed', now);
+            serverAt.asr = item.asr_ms ?? null;
             transcript = item.text || transcript;
             userBubble.answer.textContent = transcript;
             $('state').textContent = 'GENERATING';
             reply.answer.textContent = 'Thinking… first words play as soon as they stream.';
             break;
+          case 'voice.llm_first':
+            serverAt.llm = item.server_ms ?? null;
+            break;
           case 'response.created':
             $('state').textContent = 'GENERATING';
-            reply.item.querySelector('h3').textContent = item.response?.model || 'ROVE';
+            llmModel = item.response?.model || '';
+            if (llmModel) models.chat = llmModel;
+            reply.item.querySelector('h3').textContent = llmModel || 'ROVE';
             break;
           case 'response.reasoning_summary_text.delta':
             $('state').textContent = 'REASONING';
@@ -340,27 +362,50 @@ async function runVoice(blob) {
             break;
           case 'voice.first_audio':
             wall.mark('audio', now);
+            serverAt.audio = item.server_ms ?? serverAt.audio;
             serverMs = item.server_ms ?? serverMs;
             $('state').textContent = 'SPEAKING';
+            break;
+          case 'voice.tts.request':
+            ttsRequests.push({ segment: item.segment ?? ttsRequests.length, chars: item.chars ?? 0, at: now - started, serverMs: item.server_ms ?? null });
+            counts.ttsSegments++;
             break;
           case 'voice.audio.delta':
             if (item.audio) {
               wall.mark('audio', now);
-              try { player.enqueue(item.audio, item.sample_rate || 24000); } catch { /* keep text even if audio fails */ }
+              counts.audioBytes += item.bytes ?? Math.floor(item.audio.length * 3 / 4);
+              try { player.enqueue(item.audio, item.sample_rate || models.rate); } catch { /* keep text even if audio fails */ }
             }
+            break;
+          case 'voice.audio.totals':
+            counts.ttsChars = item.tts_chars ?? counts.ttsChars;
+            counts.ttsSegments = item.segments ?? counts.ttsSegments;
+            counts.audioBytes = item.bytes ?? counts.audioBytes;
             break;
           case 'response.completed': {
             const usage = document.createElement('div');
             usage.className = 'usage';
             const tokens = item.response?.usage;
-            if (tokens) usage.textContent = tokens.input_tokens + ' input · ' + tokens.output_tokens + ' output tokens (including reasoning)';
+            if (tokens) {
+              counts.inTokens = tokens.input_tokens ?? null;
+              counts.outTokens = tokens.output_tokens ?? null;
+              usage.textContent = tokens.input_tokens + ' input · ' + tokens.output_tokens + ' output tokens (including reasoning)';
+            } else usage.textContent = 'Response complete.';
             reply.item.append(usage);
             break;
           }
           case 'voice.completed':
             completed = true;
             wall.mark('done', now);
+            serverAt.done = item.server_ms ?? null;
             serverMs = item.server_ms ?? serverMs;
+            if (item.chat_model) models.chat = item.chat_model;
+            if (item.asr_model) models.asr = item.asr_model;
+            if (item.tts_model) models.tts = item.tts_model;
+            if (item.tts_voice) models.voice = item.tts_voice;
+            counts.ttsChars = item.tts_chars ?? counts.ttsChars;
+            counts.ttsSegments = item.tts_segments ?? counts.ttsSegments;
+            counts.audioBytes = item.audio_bytes ?? counts.audioBytes;
             $('state').textContent = 'COMPLETE';
             break;
           case 'response.incomplete':
@@ -376,10 +421,27 @@ async function runVoice(blob) {
     if (!completed) throw new Error('The connection ended early. Please try again.');
     if (!transcript.trim()) throw new Error('No speech was heard. Try a clearer recording.');
     if (!answer) throw new Error('No answer was returned. Please try again.');
-    const voiceLine = document.createElement('div');
-    voiceLine.className = 'usage';
-    voiceLine.textContent = `Heard in ${formatTime(wall.asr)} · first words ${formatTime(wall.firstText)} · first audio ${formatTime(wall.firstAudio)} · done ${formatTime(wall.total)} (server did ASR + AI + TTS; this device only recorded and played)`;
-    reply.item.append(voiceLine);
+    const fmt = (ms) => ms === null || ms === undefined ? '—' : formatTime(ms);
+    const audioSec = counts.audioBytes ? (counts.audioBytes / 2 / models.rate) : 0;
+    const card = document.createElement('div');
+    card.className = 'voice-analytics';
+    const total = wall.total || 1;
+    const row = (label, clientMs, serverMsValue) => {
+      const pct = clientMs === null ? 0 : Math.min(100, (clientMs / total) * 100);
+      return `<div class="pipe"><span>${label}</span><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div><b>${fmt(clientMs)}${serverMsValue !== null && serverMsValue !== undefined ? ' · srv ' + fmt(serverMsValue) : ''}</b></div>`;
+    };
+    card.innerHTML =
+      `<div class="va-title">PIPELINE ANALYTICS</div>` +
+      `<div class="va-models">ASR <b>${models.asr}</b> → chat <b>${models.chat}</b> → TTS <b>${models.tts}${models.voice ? '/' + models.voice : ''}</b> @ ${(models.rate / 1000).toFixed(0)}kHz</div>` +
+      row('Send → transcribed (speech→text)', wall.asr, serverAt.asr) +
+      row('Send → first words (LLM TTFT)', wall.firstText, serverAt.llm) +
+      row('Send → first audio (TTS)', wall.firstAudio, serverAt.audio) +
+      row('Send → done (all audio)', wall.total, serverAt.done ?? serverMs) +
+      `<div class="va-stats">upload ${(counts.upload / 1024).toFixed(1)} KB · transcript ${transcript.length} chars · answer ${answer.length} chars` +
+      `${counts.inTokens !== null ? ` · ${counts.inTokens} in / ${counts.outTokens} out tokens` : ''}` +
+      ` · TTS ${counts.ttsSegments} sentences / ${counts.ttsChars} chars · audio ${wall.audioChunks} chunks / ${(counts.audioBytes / 1024).toFixed(1)} KB ≈ ${audioSec.toFixed(1)}s · ${textGap.updates} text updates</div>` +
+      `<div class="va-note">Server did ASR + AI + TTS. This device only recorded and played. Client times include network; srv = server stopwatch.</div>`;
+    reply.item.append(card);
     history = [...input, { role: 'user', content: transcript }, { role: 'assistant', content: answer }];
     notice('Voice reply complete. Ask a follow-up by voice or text.');
   } catch (error) {

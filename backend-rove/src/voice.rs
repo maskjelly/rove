@@ -10,6 +10,11 @@ impl Drop for Worker {
     fn drop(&mut self) { self.0.abort(); }
 }
 
+const ASR_MODEL: &str = "gpt-4o-mini-transcribe";
+const TTS_MODEL: &str = "gpt-4o-mini-tts";
+const TTS_VOICE: &str = "coral";
+const TTS_SAMPLE_RATE: u32 = 24000;
+
 fn event(value: Value) -> Result<Event, Infallible> {
     Ok(Event::default().data(value.to_string()))
 }
@@ -33,11 +38,16 @@ async fn speak(state: AppState, mut phrases: mpsc::UnboundedReceiver<String>, ou
     let base = state.endpoint.trim_end_matches("/responses");
     let mut first = true;
     let mut segment = 0;
+    let mut bytes_total: usize = 0;
+    let mut tts_chars: usize = 0;
     while let Some(text) = phrases.recv().await {
         if text.trim().is_empty() { continue; }
+        tts_chars += text.len();
+        let seg = segment;
+        let _ = output.send(json!({"type":"voice.tts.request","segment":seg,"chars":text.len(),"server_ms":started.elapsed().as_millis()})).await;
         let request = state.http.post(format!("{base}/audio/speech"))
             .bearer_auth(state.key.as_deref().unwrap_or(""))
-            .json(&json!({"model":"gpt-4o-mini-tts","voice":"coral","input":text,
+            .json(&json!({"model":TTS_MODEL,"voice":TTS_VOICE,"input":text,
                 "response_format":"pcm", "instructions":"Speak naturally and clearly, at a conversational pace."}))
             .send().await;
         let mut response = match request {
@@ -51,7 +61,8 @@ async fn speak(state: AppState, mut phrases: mpsc::UnboundedReceiver<String>, ou
                         first = false;
                         if output.send(json!({"type":"voice.first_audio","server_ms":started.elapsed().as_millis()})).await.is_err() { return; }
                     }
-                    if output.send(json!({"type":"voice.audio.delta","audio":STANDARD.encode(&bytes),"sample_rate":24000,"segment":segment})).await.is_err() { return; }
+                    bytes_total += bytes.len();
+                    if output.send(json!({"type":"voice.audio.delta","audio":STANDARD.encode(&bytes),"bytes":bytes.len(),"sample_rate":TTS_SAMPLE_RATE,"segment":seg})).await.is_err() { return; }
                 }
                 Ok(None) => break,
                 Err(_) => { let _ = output.send(json!({"type":"voice.error","message":"Speech stream interrupted."})).await; return; }
@@ -59,6 +70,7 @@ async fn speak(state: AppState, mut phrases: mpsc::UnboundedReceiver<String>, ou
         }
         segment += 1;
     }
+    let _ = output.send(json!({"type":"voice.audio.totals","segments":segment,"bytes":bytes_total,"tts_chars":tts_chars,"server_ms":started.elapsed().as_millis()})).await;
 }
 
 pub(super) async fn voice(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, mut form: Multipart) -> Response {
@@ -87,14 +99,18 @@ pub(super) async fn voice(State(state): State<AppState>, ConnectInfo(peer): Conn
     if history.len() > 20 || history.iter().any(|m| !matches!(m.role.as_str(),"user"|"assistant") || m.content.trim().is_empty()) || history.iter().map(|m|m.content.len()).sum::<usize>() > 20_000 {
         return error(StatusCode::BAD_REQUEST,"Conversation history is too large or invalid.");
     }
+    let upload_bytes = audio.len();
+    let upload_mime = mime.clone();
+    let chat_model = state.model.clone();
     let stream = async_stream::stream! {
         let _permit = permit;
         let started = Instant::now();
         let base = state.endpoint.trim_end_matches("/responses");
+        yield event(json!({"type":"voice.started","asr_model":ASR_MODEL,"chat_model":chat_model,"tts_model":TTS_MODEL,"tts_voice":TTS_VOICE,"tts_sample_rate":TTS_SAMPLE_RATE,"upload_bytes":upload_bytes,"upload_mime":upload_mime}));
         yield event(json!({"type":"voice.stage","stage":"transcribing"}));
         let file = reqwest::multipart::Part::bytes(audio.to_vec()).file_name(format!("recording.{extension}")).mime_str(&mime).expect("validated MIME");
         let request = state.http.post(format!("{base}/audio/transcriptions")).bearer_auth(&key)
-            .multipart(reqwest::multipart::Form::new().part("file",file).text("model","gpt-4o-mini-transcribe").text("response_format","json").text("stream","true"))
+            .multipart(reqwest::multipart::Form::new().part("file",file).text("model",ASR_MODEL).text("response_format","json").text("stream","true"))
             .send().await;
         let mut asr = match request { Ok(response) if response.status().is_success() => response, _ => { yield failed("Transcription failed. Check audio model access or try again."); return; } };
         let mut decoder = SseDecoder::default();
@@ -147,6 +163,12 @@ pub(super) async fn voice(State(state): State<AppState>, ConnectInfo(peer): Conn
         let mut text_tx = Some(text_tx);
         let mut llm_done = false;
         let mut audio_done = false;
+        let mut llm_first_sent = false;
+        let mut answer_chars: usize = 0;
+        let mut audio_bytes: usize = 0;
+        let mut audio_segments: usize = 0;
+        let mut tts_chars: usize = 0;
+        let mut tts_segments: usize = 0;
         let mut decoder = SseDecoder::default();
         let mut pending = String::new();
         let deadline = tokio::time::sleep(Duration::from_secs(180));
@@ -162,7 +184,13 @@ pub(super) async fn voice(State(state): State<AppState>, ConnectInfo(peer): Conn
                         let value: Value = match serde_json::from_str(&data) { Ok(value) => value, Err(_) => continue };
                         let kind = value["type"].as_str().unwrap_or("");
                         if matches!(kind,"response.output_text.delta"|"response.refusal.delta") {
-                            pending.push_str(value["delta"].as_str().unwrap_or(""));
+                            let delta = value["delta"].as_str().unwrap_or("");
+                            answer_chars += delta.len();
+                            if !llm_first_sent {
+                                llm_first_sent = true;
+                                yield event(json!({"type":"voice.llm_first","server_ms":started.elapsed().as_millis()}));
+                            }
+                            pending.push_str(delta);
                             while let Some(part) = phrase(&mut pending,false) { if let Some(tx) = &text_tx { let _ = tx.send(part); } }
                         }
                         if kind == "response.completed" {
@@ -176,11 +204,33 @@ pub(super) async fn voice(State(state): State<AppState>, ConnectInfo(peer): Conn
                     }
                 }
                 audio = audio_rx.recv(), if !audio_done => {
-                    match audio { Some(value) => yield event(value), None => audio_done = true }
+                    match audio {
+                        Some(value) => {
+                            match value["type"].as_str() {
+                                Some("voice.audio.delta") => {
+                                    audio_bytes += value["bytes"].as_u64().unwrap_or(0) as usize;
+                                    if let Some(seg) = value["segment"].as_u64() { audio_segments = audio_segments.max(seg as usize + 1); }
+                                }
+                                Some("voice.tts.request") => { tts_segments += 1; }
+                                Some("voice.audio.totals") => {
+                                    audio_segments = value["segments"].as_u64().unwrap_or(0) as usize;
+                                    audio_bytes = value["bytes"].as_u64().unwrap_or(0) as usize;
+                                    tts_chars = value["tts_chars"].as_u64().unwrap_or(0) as usize;
+                                    tts_segments = audio_segments;
+                                }
+                                _ => {}
+                            }
+                            yield event(value);
+                        }
+                        None => audio_done = true,
+                    }
                 }
             }
         }
-        yield event(json!({"type":"voice.completed","server_ms":started.elapsed().as_millis()}));
+        yield event(json!({"type":"voice.completed","server_ms":started.elapsed().as_millis(),
+            "chat_model":chat_model,"asr_model":ASR_MODEL,"tts_model":TTS_MODEL,"tts_voice":TTS_VOICE,
+            "upload_bytes":upload_bytes,"transcript_chars":transcript.len(),"answer_chars":answer_chars,
+            "audio_segments":audio_segments,"audio_bytes":audio_bytes,"tts_chars":tts_chars,"tts_segments":tts_segments}));
     };
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(5))).into_response()
 }
