@@ -40,8 +40,9 @@ The server accepts chat requests directly and streams the answer back.
 
 ## Observer
 
-Every streamed line is teed into a short server-side ring buffer. From any
-device, including a phone:
+Every streamed line is teed into a short server-side ring buffer, rendered
+as plain readable lines — user messages, answer text as it arrives, commands
+run, token totals. From any device, including a phone:
 
 ```sh
 curl -N https://45.196.196.251/tap

@@ -118,6 +118,7 @@ try:
     with urllib.request.urlopen(base + '/tap?tail=200', timeout=5) as response:
         tap = response.read().decode()
     assert 'runcmd' in tap and 'echo tool-ok' in tap and 'Tool says: tool-ok' in tap, tap
+    assert '"response.created"' not in tap and 'item_id' not in tap, 'tap must render plain lines, not raw JSON'
     before = len(requests)
     invalid = urllib.request.Request(base+'/chat', data=json.dumps({'messages':[{'role':'system','content':'invalid'}]}).encode(), headers={'Content-Type':'application/json'})
     try:

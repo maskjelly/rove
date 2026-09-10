@@ -68,6 +68,50 @@ fn tap_line(kind: &str, text: &str) -> String {
     format!("[{}] {kind} {short}", stamp())
 }
 
+/// Human-readable one-liner for a streamed event. Protocol noise
+/// (item added/done bookkeeping, empty frames) renders to nothing.
+fn render_tap_event(value: &Value) -> Option<String> {
+    let short = |text: &str| {
+        let short: String = text.chars().take(300).collect();
+        short
+    };
+    match value.get("type")?.as_str()? {
+        "response.created" => Some(format!(
+            "· {} thinking…",
+            value
+                .get("response")?
+                .get("model")?
+                .as_str()
+                .unwrap_or("AI")
+        )),
+        "response.reasoning_summary_text.delta" => value
+            .get("delta")?
+            .as_str()
+            .map(|d| format!("~ {}", short(d))),
+        "response.output_text.delta" | "response.refusal.delta" => {
+            value.get("delta")?.as_str().map(short)
+        }
+        "response.completed" => {
+            let usage = value.get("response")?.get("usage")?;
+            Some(format!(
+                "✓ done · {} in / {} out tokens",
+                usage.get("input_tokens")?,
+                usage.get("output_tokens")?
+            ))
+        }
+        "response.incomplete" => Some("! stopped early (output limit)".into()),
+        "response.failed" => Some("! model run failed".into()),
+        "error" => Some(format!(
+            "! {}",
+            value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("stream failed")
+        )),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     http: reqwest::Client,
@@ -324,11 +368,18 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                                 if data == "[DONE]" {
                                     continue;
                                 }
-                                tap.push(tap_line("<", &data));
-                                let Ok(value): Result<Value, _> = serde_json::from_str(&data) else {
+                                let Ok(value): Result<Value, _> = serde_json::from_str(&data)
+                                else {
                                     continue;
                                 };
-                                if value.get("type").and_then(|t| t.as_str()) == Some("response.completed") {
+                                if let Some(line) = render_tap_event(&value)
+                                    && !line.trim().is_empty()
+                                {
+                                    tap.push(format!("[{}] < {line}", stamp()));
+                                }
+                                if value.get("type").and_then(|t| t.as_str())
+                                    == Some("response.completed")
+                                {
                                     if let Some(output) = value
                                         .get("response")
                                         .and_then(|r| r.get("output"))
@@ -370,10 +421,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     .and_then(|args| args.get("command")?.as_str().map(str::to_string))
                     .unwrap_or_default();
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.call", "command": command})));
-                tap.push(tap_line("<", &format!("exec.call {command}")));
+                tap.push(format!("[{}] $ {command}", stamp()));
                 let (code, output, ms) = run_command(&command).await;
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.done", "exit": code, "ms": ms})));
-                tap.push(tap_line("<", &format!("exec.done exit={code} ms={ms}")));
+                tap.push(format!("[{0}] [exit {code} · {ms}ms]", stamp()));
                 turn.push(json!({"type": "function_call_output", "call_id": call_id, "output": output}));
             }
             turn_input = turn;
@@ -404,9 +455,11 @@ async fn tap(
             .into_response();
     }
     let tap = state.tap.clone();
+    // Plain-text streaming (not SSE framing): observers watch with plain
+    // `curl -N`, so lines arrive exactly as shown, with no `data:` noise.
     let stream = async_stream::stream! {
         for line in tap.snapshot() {
-            yield Ok::<_, Infallible>(axum::body::Bytes::from(format!("data: {line}\n\n")));
+            yield Ok::<_, Infallible>(axum::body::Bytes::from(format!("{line}\n")));
         }
         let mut rx = tap.tx.subscribe();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
@@ -414,9 +467,9 @@ async fn tap(
         heartbeat.tick().await;
         loop {
             tokio::select! {
-                _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
+                _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b"\n")),
                 got = rx.recv() => match got {
-                    Ok(line) => yield Ok(axum::body::Bytes::from(format!("data: {line}\n\n"))),
+                    Ok(line) => yield Ok(axum::body::Bytes::from(format!("{line}\n"))),
                     Err(_) => break,
                 },
             }
@@ -424,7 +477,7 @@ async fn tap(
     };
     (
         [
-            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache, no-transform"),
         ],
         Body::from_stream(stream),
