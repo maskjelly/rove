@@ -9,8 +9,64 @@ use axum::{
 use backend_rove::{MAX_BYTES, MAX_MESSAGES, SseDecoder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{Semaphore, broadcast};
+
+/// Live observer tap: every streamed line is teed here. `GET /tap` replays
+/// recent history then tails live, so any device (e.g. `curl` on a phone)
+/// can watch what flows between clients and the server.
+#[derive(Clone)]
+struct Tap {
+    tx: broadcast::Sender<String>,
+    buf: Arc<std::sync::Mutex<VecDeque<String>>>,
+}
+
+impl Tap {
+    fn new() -> Self {
+        let (tx, _) = broadcast::channel(512);
+        Self {
+            tx,
+            buf: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+        }
+    }
+
+    fn push(&self, line: String) {
+        if let Ok(mut buf) = self.buf.lock() {
+            buf.push_back(line.clone());
+            while buf.len() > 500 {
+                buf.pop_front();
+            }
+        }
+        let _ = self.tx.send(line);
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.buf
+            .lock()
+            .map(|buf| buf.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+fn stamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let day = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86400;
+    format!("{:02}:{:02}:{:02}", day / 3600, day % 3600 / 60, day % 60)
+}
+
+fn tap_line(kind: &str, text: &str) -> String {
+    let short: String = text.chars().take(300).collect();
+    format!("[{}] {kind} {short}", stamp())
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -19,6 +75,7 @@ struct AppState {
     model: String,
     endpoint: String,
     slots: Arc<Semaphore>,
+    tap: Tap,
 }
 
 #[derive(Deserialize)]
@@ -201,6 +258,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
     let endpoint = state.endpoint.clone();
     let model = state.model.clone();
     let key: String = key.clone();
+    let tap = state.tap.clone();
+    if let Some(last) = request.messages.last() {
+        tap.push(tap_line(">", &last.content));
+    }
     let stream = async_stream::stream! {
         // Held until completion or client disconnect; dropping this stream closes upstream.
         let _permit = permit;
@@ -220,6 +281,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 Some(response) => response,
                 None => {
                     if round >= MAX_TOOL_ROUNDS {
+                        tap.push(tap_line("!", "stopped after 8 tool steps"));
                         yield Ok::<_, Infallible>(sse_error("Stopped after 8 tool steps. Ask in smaller pieces."));
                         break 'rounds;
                     }
@@ -241,6 +303,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     {
                         Ok(response) if response.status().is_success() => response,
                         _ => {
+                            tap.push(tap_line("!", "follow-up model request failed"));
                             yield Ok::<_, Infallible>(sse_error("The model request failed. Please try again."));
                             break 'rounds;
                         }
@@ -256,11 +319,12 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
                     chunk = upstream.chunk() => match chunk {
                         Ok(Some(bytes)) => {
-                            // Control-plane peek: wire bytes go out verbatim.
+                            // Control-plane peek + observer tee; wire bytes go out verbatim.
                             for data in decoder.push(&bytes).unwrap_or_default() {
                                 if data == "[DONE]" {
                                     continue;
                                 }
+                                tap.push(tap_line("<", &data));
                                 let Ok(value): Result<Value, _> = serde_json::from_str(&data) else {
                                     continue;
                                 };
@@ -279,6 +343,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                         }
                         Ok(None) => break,
                         Err(_) => {
+                            tap.push(tap_line("!", "upstream stream interrupted"));
                             yield Ok::<_, Infallible>(sse_error("Upstream stream interrupted; please retry."));
                             break 'rounds;
                         }
@@ -305,11 +370,56 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     .and_then(|args| args.get("command")?.as_str().map(str::to_string))
                     .unwrap_or_default();
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.call", "command": command})));
+                tap.push(tap_line("<", &format!("exec.call {command}")));
                 let (code, output, ms) = run_command(&command).await;
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.done", "exit": code, "ms": ms})));
+                tap.push(tap_line("<", &format!("exec.done exit={code} ms={ms}")));
                 turn.push(json!({"type": "function_call_output", "call_id": call_id, "output": output}));
             }
             turn_input = turn;
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache, no-transform"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn tap(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    // ?tail=N peeks at recent history and closes; plain GET streams live.
+    if let Some(n) = params.get("tail").and_then(|v| v.parse::<usize>().ok()) {
+        let lines = state.tap.snapshot();
+        let from = lines.len().saturating_sub(n.min(500));
+        return (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            lines[from..].join("\n") + "\n",
+        )
+            .into_response();
+    }
+    let tap = state.tap.clone();
+    let stream = async_stream::stream! {
+        for line in tap.snapshot() {
+            yield Ok::<_, Infallible>(axum::body::Bytes::from(format!("data: {line}\n\n")));
+        }
+        let mut rx = tap.tx.subscribe();
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
+                got = rx.recv() => match got {
+                    Ok(line) => yield Ok(axum::body::Bytes::from(format!("data: {line}\n\n"))),
+                    Err(_) => break,
+                },
+            }
         }
     };
     (
@@ -341,9 +451,11 @@ async fn main() {
                 .trim_end_matches('/')
         ),
         slots: Arc::new(Semaphore::new(8)),
+        tap: Tap::new(),
     };
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/tap", get(tap))
         .route("/chat", post(chat).layer(DefaultBodyLimit::max(64 * 1024)))
         .with_state(state);
     let addr = std::env::var("ROVE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());

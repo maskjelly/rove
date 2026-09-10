@@ -115,6 +115,9 @@ try:
     assert chr(36) + ' echo tool-ok' in client.stdout, client.stdout
     assert 'Tool says: tool-ok' in client.stdout, client.stdout
     assert len(tool_calls) == 1 and tool_calls[0]['call_id'] == 'call_1', tool_calls
+    with urllib.request.urlopen(base + '/tap?tail=200', timeout=5) as response:
+        tap = response.read().decode()
+    assert 'runcmd' in tap and 'echo tool-ok' in tap and 'Tool says: tool-ok' in tap, tap
     before = len(requests)
     invalid = urllib.request.Request(base+'/chat', data=json.dumps({'messages':[{'role':'system','content':'invalid'}]}).encode(), headers={'Content-Type':'application/json'})
     try:
@@ -129,7 +132,7 @@ try:
     idle.send_signal(signal.SIGINT)
     idle.wait(timeout=3)
     idle.stdin.close()
-    print('PASS: summaries, split UTF-8, answers, history/reset, quota, disconnect, validation, idle cancellation, tool round-trip')
+    print('PASS: summaries, split UTF-8, answers, history/reset, quota, disconnect, validation, idle cancellation, tool round-trip, observer tap')
 finally:
     server.terminate()
     server.wait(timeout=5)

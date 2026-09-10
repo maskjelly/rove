@@ -38,6 +38,18 @@ the endpoint is public, so anyone who finds it can ask for commands too.
 streams OpenAI Responses SSE events back. `GET /health` returns `ok`.
 The server accepts chat requests directly and streams the answer back.
 
+## Observer
+
+Every streamed line is teed into a short server-side ring buffer. From any
+device, including a phone:
+
+```sh
+curl -N https://45.196.196.251/tap
+```
+
+replays recent history, then tails live as clients chat. `GET /tap?tail=50`
+prints the last lines and closes — a quick peek without hanging.
+
 Root-only `/etc/rove.env` supplies `OPENAI_API_KEY` and `OPENAI_MODEL` to systemd.
 Default: `gpt-5-mini`, low reasoning effort, automatic reasoning summaries,
 2,048 maximum output tokens (including reasoning), eight concurrent requests,
