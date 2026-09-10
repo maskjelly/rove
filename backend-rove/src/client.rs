@@ -8,24 +8,13 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-async fn connect(http: &reqwest::Client) -> Result<String> {
-    let base = std::env::args()
+/// Base URL is known up front, so there is no health-check round trip:
+/// the first POST doubles as the reachability probe and saves ~200ms.
+fn base_url() -> String {
+    std::env::args()
         .nth(1)
         .map(|b| b.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| "https://45.196.196.251".to_string());
-    for _ in 0..100 {
-        if let Ok(response) = http
-            .get(format!("{base}/health"))
-            .timeout(Duration::from_secs(1))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            return Ok(base);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(format!("Server did not become reachable at {base}.").into())
+        .unwrap_or_else(|| "https://45.196.196.251".to_string())
 }
 
 async fn response(http: &reqwest::Client, base: &str, messages: &[Value]) -> Result<String> {
@@ -115,7 +104,7 @@ async fn run() -> Result<()> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(200))
         .build()?;
-    let base = connect(&http).await?;
+    let base = base_url();
     println!("Rove chat · /new clears history · /exit quits · Ctrl-C cancels and exits");
     println!(
         "Conversation stays in this client session. Recent turns are sent with each message.\n"

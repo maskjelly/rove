@@ -336,7 +336,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
     let tools = json!([exec_tool_def()]);
-    let instructions = "You are Rove, a helpful assistant with a run_command tool that executes shell commands on this server as an unprivileged user (30s limit, output truncated past ~12KB). Use it whenever the user asks about the server or wants something done on it: probe with read-only commands first, then act. Be concise and practical.";
+    let instructions = "You are Rove, a terse assistant with a run_command tool for operating this server (30s limit). Probe read-only first. Be concise.";
     let upstream = state
         .http
         .post(&state.endpoint)
@@ -349,7 +349,8 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
             "stream": true,
             "store": false,
             "reasoning": {"effort": "low", "summary": "auto"},
-            "max_output_tokens": 2048
+            "max_output_tokens": 2048,
+            "service_tier": "priority"
         }))
         .send()
         .await;
@@ -426,7 +427,8 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                             "stream": true,
                             "store": false,
                             "reasoning": {"effort": "low", "summary": "auto"},
-                            "max_output_tokens": 2048
+                            "max_output_tokens": 2048,
+            "service_tier": "priority"
                         }))
                         .send()
                         .await
