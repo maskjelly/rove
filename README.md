@@ -25,8 +25,12 @@ History lives in client memory, not on disk. Recent turns are sent each time;
 older turns are dropped when the 21-message/24-KB context limit is reached.
 Failed or interrupted turns are not saved. Restarting the client starts fresh.
 
-The server calls OpenAI; the model does not run locally on the VPS. This version
-is chat only: it has no shell, file editing, or autonomous tool execution.
+The server calls OpenAI; the model does not run locally on the VPS. The
+assistant has one tool: `run_command` executes shell commands on the server
+as an unprivileged user (30s timeout, output truncated past ~12KB, secrets
+scrubbed from the command environment). Ask it about the server or tell it to
+do something there; each call prints as `$ command` with its exit code. Note
+the endpoint is public, so anyone who finds it can ask for commands too.
 
 ## Server
 

@@ -6,9 +6,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use backend_rove::{MAX_BYTES, MAX_MESSAGES};
+use backend_rove::{MAX_BYTES, MAX_MESSAGES, SseDecoder};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
@@ -34,6 +34,83 @@ struct ChatRequest {
 
 fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": message}))).into_response()
+}
+
+/// At most 8 model responses per chat request: enough for real tool chains,
+/// bounded against runaway loops.
+const MAX_TOOL_ROUNDS: u8 = 8;
+
+fn exec_tool_def() -> Value {
+    json!({
+        "type": "function",
+        "name": "run_command",
+        "description": "Run a shell command on the server with sh -c as an unprivileged user. 30 second timeout, output truncated past ~12KB. Prefer read-only probing (ls, cat, df, uname, systemctl status) before changing anything, and report what each command showed.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to run on the server"}
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Run one shell command. Secrets are scrubbed from the child environment;
+/// output is capped; overruns are killed.
+async fn run_command(command: &str) -> (i32, String, u64) {
+    let start = std::time::Instant::now();
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .kill_on_drop(true);
+    let spawned = cmd.spawn();
+    let ms = || start.elapsed().as_millis() as u64;
+    let child = match spawned {
+        Ok(child) => child,
+        Err(e) => return (-1, format!("failed to start shell: {e}"), ms()),
+    };
+    match tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let code = output.status.code().unwrap_or(-1);
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                text.push_str("\nstderr:\n");
+                text.push_str(&stderr);
+            }
+            if text.len() > 12_000 {
+                text.truncate(12_000);
+                text.push_str("\n…(output truncated)");
+            }
+            if text.trim().is_empty() {
+                text = format!("<no output, exit {code}>");
+            }
+            (code, text, ms())
+        }
+        Ok(Err(e)) => (-1, format!("failed to read command output: {e}"), ms()),
+        Err(_) => (
+            -1,
+            "command timed out after 30s and was killed".into(),
+            ms(),
+        ),
+    }
+}
+
+fn sse_error(message: &str) -> axum::body::Bytes {
+    axum::body::Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        json!({"type": "error", "message": message})
+    ))
+}
+
+fn sse_event(value: &Value) -> axum::body::Bytes {
+    axum::body::Bytes::from(format!("data: {value}\n\n"))
 }
 
 async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -> Response {
@@ -76,14 +153,17 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         .iter()
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
+    let tools = json!([exec_tool_def()]);
+    let instructions = "You are Rove, a helpful assistant with a run_command tool that executes shell commands on this server as an unprivileged user (30s limit, output truncated past ~12KB). Use it whenever the user asks about the server or wants something done on it: probe with read-only commands first, then act. Be concise and practical.";
     let upstream = state
         .http
         .post(&state.endpoint)
         .bearer_auth(key)
         .json(&json!({
             "model": state.model,
-            "instructions": "You are Rove, a helpful assistant. Be concise and practical. You have no shell or file tools; never claim to have executed commands or edited files.",
+            "instructions": instructions,
             "input": input,
+            "tools": tools,
             "stream": true,
             "store": false,
             "reasoning": {"effort": "low", "summary": "auto"},
@@ -91,7 +171,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         }))
         .send()
         .await;
-    let mut upstream = match upstream {
+    let upstream = match upstream {
         Ok(response) => response,
         Err(_) => {
             return error(
@@ -116,6 +196,11 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         };
         return error(StatusCode::BAD_GATEWAY, message);
     }
+    // The SSE stream must be 'static: hand it owned copies of everything.
+    let http = state.http.clone();
+    let endpoint = state.endpoint.clone();
+    let model = state.model.clone();
+    let key: String = key.clone();
     let stream = async_stream::stream! {
         // Held until completion or client disconnect; dropping this stream closes upstream.
         let _permit = permit;
@@ -124,18 +209,107 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await;
-        loop {
-            tokio::select! {
-                _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
-                chunk = upstream.chunk() => match chunk {
-                    Ok(Some(bytes)) => yield Ok(bytes),
-                    Ok(None) => break,
-                    Err(_) => {
-                        yield Ok(axum::body::Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"message\":\"Upstream stream interrupted; please retry.\"}\n\n"));
-                        break;
+        // First round reuses the already-sent request above so its HTTP errors
+        // keep their status codes; later rounds failed mid-stream become SSE
+        // error events instead.
+        let mut pending: Option<reqwest::Response> = Some(upstream);
+        let mut turn_input = Vec::new();
+        let mut round: u8 = 0;
+        'rounds: loop {
+            let mut upstream = match pending.take() {
+                Some(response) => response,
+                None => {
+                    if round >= MAX_TOOL_ROUNDS {
+                        yield Ok::<_, Infallible>(sse_error("Stopped after 8 tool steps. Ask in smaller pieces."));
+                        break 'rounds;
                     }
-                },
+                    match http
+                        .post(&endpoint)
+                        .bearer_auth(&key)
+                        .json(&json!({
+                            "model": model,
+                            "instructions": instructions,
+                            "input": turn_input,
+                            "tools": tools,
+                            "stream": true,
+                            "store": false,
+                            "reasoning": {"effort": "low", "summary": "auto"},
+                            "max_output_tokens": 2048
+                        }))
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => response,
+                        _ => {
+                            yield Ok::<_, Infallible>(sse_error("The model request failed. Please try again."));
+                            break 'rounds;
+                        }
+                    }
+                }
+            };
+            round += 1;
+            let mut decoder = SseDecoder::default();
+            let mut output_items: Vec<Value> = Vec::new();
+            let mut completed = false;
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
+                    chunk = upstream.chunk() => match chunk {
+                        Ok(Some(bytes)) => {
+                            // Control-plane peek: wire bytes go out verbatim.
+                            for data in decoder.push(&bytes).unwrap_or_default() {
+                                if data == "[DONE]" {
+                                    continue;
+                                }
+                                let Ok(value): Result<Value, _> = serde_json::from_str(&data) else {
+                                    continue;
+                                };
+                                if value.get("type").and_then(|t| t.as_str()) == Some("response.completed") {
+                                    if let Some(output) = value
+                                        .get("response")
+                                        .and_then(|r| r.get("output"))
+                                        .and_then(|o| o.as_array())
+                                    {
+                                        output_items = output.clone();
+                                    }
+                                    completed = true;
+                                }
+                            }
+                            yield Ok(bytes);
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            yield Ok::<_, Infallible>(sse_error("Upstream stream interrupted; please retry."));
+                            break 'rounds;
+                        }
+                    },
+                }
             }
+            let calls: Vec<(String, String)> = output_items
+                .iter()
+                .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+                .filter_map(|item| {
+                    Some((
+                        item.get("call_id")?.as_str()?.to_string(),
+                        item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}").to_string(),
+                    ))
+                })
+                .collect();
+            if calls.is_empty() || !completed {
+                break 'rounds;
+            }
+            let mut turn = output_items;
+            for (call_id, arguments) in calls {
+                let command = serde_json::from_str::<Value>(&arguments)
+                    .ok()
+                    .and_then(|args| args.get("command")?.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.call", "command": command})));
+                let (code, output, ms) = run_command(&command).await;
+                yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.done", "exit": code, "ms": ms})));
+                turn.push(json!({"type": "function_call_output", "call_id": call_id, "output": output}));
+            }
+            turn_input = turn;
         }
     };
     (
@@ -180,4 +354,23 @@ async fn main() {
     axum::serve(listener, app.into_make_service())
         .await
         .expect("serve requests");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exec_runs_and_reports() {
+        let (code, output, _) = run_command("echo hi").await;
+        assert_eq!(code, 0);
+        assert_eq!(output, "hi\n");
+    }
+
+    #[tokio::test]
+    async fn exec_missing_command_fails_loudly() {
+        let (code, output, _) = run_command("exit 3").await;
+        assert_eq!(code, 3);
+        assert!(output.contains("exit 3"));
+    }
 }

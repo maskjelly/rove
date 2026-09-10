@@ -81,17 +81,23 @@ async fn response(http: &reqwest::Client, base: &str, messages: &[Value]) -> Res
                 }
                 "response.incomplete" => return Err(format!("Response stopped early: {}. Ask a shorter question or increase the server token limit.", event["response"]["incomplete_details"]["reason"].as_str().unwrap_or("unknown reason")).into()),
                 "response.failed" | "error" => return Err("AI stream failed. Check API billing or retry; the partial answer was not saved to history.".into()),
+                "exec.call" => {
+                    println!("\n$ {}", event["command"].as_str().unwrap_or(""));
+                }
+                "exec.done" => {
+                    println!(
+                        "[exit {} · {}ms]",
+                        event["exit"].as_i64().unwrap_or(-1),
+                        event["ms"].as_u64().unwrap_or(0)
+                    );
+                }
                 _ => {}
             }
             io::stdout().flush()?;
-            if completed {
-                break;
-            }
-        }
-        if completed {
-            break;
         }
     }
+    // Read until the server closes the stream: one turn can span several
+    // model responses when tools run (completed, exec events, completed...).
     if !completed {
         return Err(
             "Connection ended before completion. Please retry; partial output was not saved."

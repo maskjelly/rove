@@ -12,6 +12,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 requests = []
+tool_calls = []
 
 class Mock(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -25,7 +26,38 @@ class Mock(BaseHTTPRequestHandler):
         assert body['max_output_tokens'] == 2048
         assert body['reasoning']['summary'] == 'auto'
         requests.append(body)
-        prompt = body['input'][-1]['content']
+        last = body['input'][-1]
+        prompt = last.get('content', '') if isinstance(last, dict) else ''
+        followup = next((m for m in body['input'] if isinstance(m, dict) and m.get('type') == 'function_call_output'), None)
+        if followup is not None:
+            assert followup['call_id'] == 'call_1', followup
+            assert 'tool-ok' in followup['output'], followup
+            tool_calls.append(followup)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.end_headers()
+            def emit(value):
+                data = ('data: ' + json.dumps(value, ensure_ascii=False) + chr(13) + chr(10) + chr(10)).encode()
+                self.wfile.write(data)
+                self.wfile.flush()
+            emit({'type': 'response.created', 'response': {'model': 'mock-mini'}})
+            emit({'type': 'response.output_text.delta', 'delta': 'Tool says: tool-ok. All good.'})
+            emit({'type': 'response.completed', 'response': {'usage': {'input_tokens': 10, 'output_tokens': 8}}})
+            return
+        if prompt == 'runcmd':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.end_headers()
+            def emit(value):
+                data = ('data: ' + json.dumps(value, ensure_ascii=False) + chr(13) + chr(10) + chr(10)).encode()
+                self.wfile.write(data)
+                self.wfile.flush()
+            emit({'type': 'response.created', 'response': {'model': 'mock-mini'}})
+            emit({'type': 'response.output_text.delta', 'delta': 'Checking. '})
+            emit({'type': 'response.completed', 'response': {'usage': {'input_tokens': 10, 'output_tokens': 8}, 'output': [
+                {'type': 'message', 'id': 'msg_1', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Checking. '}]},
+                {'type': 'function_call', 'id': 'fc_1', 'call_id': 'call_1', 'name': 'run_command', 'arguments': '{' + chr(34) + 'command' + chr(34) + ': ' + chr(34) + 'echo tool-ok' + chr(34) + '}'}]}})
+            return
         if prompt == 'quota':
             self.send_response(429)
             self.end_headers()
@@ -68,7 +100,7 @@ try:
             time.sleep(.05)
     else:
         raise RuntimeError('Server did not start')
-    client = subprocess.run([sys.argv[2], base], input='hello\nfollow up\n/new\nnew chat\nquota\ndisconnect\n/exit\n', text=True, capture_output=True, timeout=15)
+    client = subprocess.run([sys.argv[2], base], input='hello\nfollow up\n/new\nnew chat\nquota\ndisconnect\nruncmd\n/exit\n', text=True, capture_output=True, timeout=20)
     assert client.returncode == 0, client.stderr
     assert client.stdout.count('hé🙂 world') == 3, client.stdout
     assert 'Reasoning summary' in client.stdout
@@ -78,7 +110,11 @@ try:
     assert 'quota or rate limit' in client.stderr
     assert 'Connection ended before completion' in client.stderr
     assert 'secret-should-not-leak' not in client.stderr
-    assert len(requests[-1]['input']) == 3, 'Failed turns must not enter history'
+    disc = next(r for r in requests if isinstance(r['input'][-1], dict) and r['input'][-1].get('content') == 'disconnect')
+    assert len(disc['input']) == 3, 'Failed turns must not enter history'
+    assert chr(36) + ' echo tool-ok' in client.stdout, client.stdout
+    assert 'Tool says: tool-ok' in client.stdout, client.stdout
+    assert len(tool_calls) == 1 and tool_calls[0]['call_id'] == 'call_1', tool_calls
     before = len(requests)
     invalid = urllib.request.Request(base+'/chat', data=json.dumps({'messages':[{'role':'system','content':'invalid'}]}).encode(), headers={'Content-Type':'application/json'})
     try:
@@ -93,7 +129,7 @@ try:
     idle.send_signal(signal.SIGINT)
     idle.wait(timeout=3)
     idle.stdin.close()
-    print('PASS: summaries, split UTF-8, answers, history/reset, quota, disconnect, validation, idle cancellation')
+    print('PASS: summaries, split UTF-8, answers, history/reset, quota, disconnect, validation, idle cancellation, tool round-trip')
 finally:
     server.terminate()
     server.wait(timeout=5)
