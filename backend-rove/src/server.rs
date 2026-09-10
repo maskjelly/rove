@@ -1,19 +1,16 @@
-mod sessions;
-mod voice;
 use axum::{
     Json, Router,
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response, Sse, sse::Event},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::Utc;
+use backend_rove::{MAX_BYTES, MAX_MESSAGES};
 use serde::Deserialize;
 use serde_json::json;
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
-use tokio_stream::{Stream, StreamExt, wrappers::IntervalStream};
 
 #[derive(Clone)]
 struct AppState {
@@ -22,7 +19,6 @@ struct AppState {
     model: String,
     endpoint: String,
     slots: Arc<Semaphore>,
-    sessions: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -45,13 +41,10 @@ async fn chat(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(request): Json<ChatRequest>,
 ) -> Response {
-    // SSH and the public HTTPS reverse proxy connect from loopback.
-    // Direct plain-HTTP chat on port 3000 stays disabled; never trust forwarded headers.
+    // Only loopback may chat: the terminal client connects through `ssh rove`
+    // (or explicitly passes a base URL). Never trust forwarded headers.
     if !peer.ip().is_loopback() {
-        return error(
-            StatusCode::FORBIDDEN,
-            "Open https://45.196.196.251 or connect through the SSH client.",
-        );
+        return error(StatusCode::FORBIDDEN, "Connect through the SSH client.");
     }
     let Some(key) = &state.key else {
         return error(
@@ -60,7 +53,7 @@ async fn chat(
         );
     };
     if request.messages.is_empty()
-        || request.messages.len() > 21
+        || request.messages.len() > MAX_MESSAGES
         || request.messages.iter().any(|m| {
             !matches!(m.role.as_str(), "user" | "assistant") || m.content.trim().is_empty()
         })
@@ -69,7 +62,7 @@ async fn chat(
             .iter()
             .map(|m| m.content.len())
             .sum::<usize>()
-            > 24_000
+            > MAX_BYTES
         || request.messages.last().map(|m| m.role.as_str()) != Some("user")
     {
         return error(
@@ -92,18 +85,21 @@ async fn chat(
         .iter()
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
-    let upstream = state.http.post(&state.endpoint)
+    let upstream = state
+        .http
+        .post(&state.endpoint)
         .bearer_auth(key)
         .json(&json!({
             "model": state.model,
-            "instructions": "You are Rove, a helpful assistant. Be concise and practical. You can discuss code, but you have no shell or file tools; never claim to have executed commands or edited files.",
+            "instructions": "You are Rove, a helpful assistant. Be concise and practical. You have no shell or file tools; never claim to have executed commands or edited files.",
             "input": input,
             "stream": true,
             "store": false,
             "reasoning": {"effort": "low", "summary": "auto"},
             "max_output_tokens": 2048
         }))
-        .send().await;
+        .send()
+        .await;
     let mut upstream = match upstream {
         Ok(response) => response,
         Err(_) => {
@@ -155,117 +151,10 @@ async fn chat(
         [
             (header::CONTENT_TYPE, "text/event-stream"),
             (header::CACHE_CONTROL, "no-cache, no-transform"),
-            (header::HeaderName::from_static("x-accel-buffering"), "no"),
         ],
         Body::from_stream(stream),
     )
         .into_response()
-}
-
-async fn sse_event_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(5))).map(|_| {
-        Ok(Event::default().data(format!(
-            "New data from the server at: {}",
-            Utc::now().format("%d/%m/%Y %H:%M:%S")
-        )))
-    });
-    Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(5)))
-}
-
-/// Frontend bundle with content-hash cache busting.
-///
-/// `index.html` and `app.js` carry a `{{ASSET_HASH}}` placeholder that is
-/// stamped with a hash of the bundle at startup. HTML is served `no-store`
-/// so browsers always pick up the newest asset URLs; the hashed JS/CSS
-/// URLs are `immutable` and safe to cache forever.
-/// FNV-1a 64-bit: stable across restarts (unlike DefaultHasher), so the
-/// immutable asset URLs only change when the bytes actually change.
-fn content_hash(parts: &[&str]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for part in parts {
-        for b in part.bytes() {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
-fn frontend_app(state: AppState) -> Router {
-    let raw_html = include_str!("../../frontend-rove/index.html");
-    let raw_css = include_str!("../../frontend-rove/app.css");
-    let raw_js = include_str!("../../frontend-rove/app.js");
-    let raw_boot = include_str!("../../frontend-rove/boot.js");
-    let raw_stream = include_str!("../../frontend-rove/stream.mjs");
-    let raw_voice = include_str!("../../frontend-rove/voice.mjs");
-    let hash = content_hash(&[raw_html, raw_css, raw_js, raw_boot, raw_stream, raw_voice]);
-    let stamped = |raw: &str| raw.replace("{{ASSET_HASH}}", &hash);
-    let html = Html(stamped(raw_html));
-    // Owned because the {{ASSET_HASH}} stamp differs per build; leaked once,
-    // served forever. Plain files stay zero-copy.
-    let js: &'static str = Box::leak(stamped(raw_js).into_boxed_str());
-    let voice: &'static str = Box::leak(stamped(raw_voice).into_boxed_str());
-    let css: &'static str = raw_css;
-    let boot: &'static str = raw_boot;
-    let stream: &'static str = raw_stream;
-    let asset = |content_type: &'static str, body: &'static str| {
-        (
-            [
-                (header::CONTENT_TYPE, content_type),
-                (
-                    header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
-                ),
-            ],
-            body,
-        )
-    };
-    Router::new()
-        .route(
-            "/",
-            get(move || {
-                let html = html.clone();
-                async move {
-                    (
-                        [(header::CACHE_CONTROL, "no-store")],
-                        html,
-                    )
-                }
-            }),
-        )
-        .route(
-            "/app.css",
-            get(move || async move { asset("text/css; charset=utf-8", css) }),
-        )
-        .route(
-            "/app.js",
-            get(move || async move { asset("text/javascript; charset=utf-8", js) }),
-        )
-        .route(
-            "/boot.js",
-            get(move || async move { asset("text/javascript; charset=utf-8", boot) }),
-        )
-        .route(
-            "/stream.mjs",
-            get(move || async move { asset("text/javascript; charset=utf-8", stream) }),
-        )
-        .route("/health", get(|| async { "ok" }))
-        .route("/events", get(sse_event_handler))
-        .route(
-            "/chat",
-            post(chat).layer(DefaultBodyLimit::max(128 * 1024)),
-        )
-        .route("/voice", post(voice::voice).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
-        .route("/session/{id}", get(sessions::get))
-        .route(
-            "/voice.mjs",
-            get(move || async move { asset("text/javascript; charset=utf-8", voice) }),
-        )
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
-        .with_state(state)
 }
 
 #[tokio::main]
@@ -287,12 +176,12 @@ async fn main() {
                 .trim_end_matches('/')
         ),
         slots: Arc::new(Semaphore::new(8)),
-        sessions: std::env::var("ROVE_SESSIONS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("sessions")),
     };
-    let app = frontend_app(state);
-    let addr = std::env::var("ROVE_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/chat", post(chat).layer(DefaultBodyLimit::max(64 * 1024)))
+        .with_state(state);
+    let addr = std::env::var("ROVE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind server");

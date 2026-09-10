@@ -18,17 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo build --release --locked --bin server --bin client
-      - name: Verify health and event stream
-        run: python3 ../deploy/smoke-test.py target/release/server
-      - name: Verify browser SSE decoding and latency measurements
-        run: node --test ../deploy/web-client.test.mjs
       - name: Verify AI streaming and errors without API credits
         run: python3 ../deploy/test-chat.py target/release/server target/release/client
-      - name: Verify voice pipeline, sessions and resume without API credits
-        run: python3 ../deploy/test-voice.py target/release/server
   deploy:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: check

@@ -9,11 +9,15 @@ https://45.196.196.251 {
         X-Content-Type-Options nosniff
         Referrer-Policy no-referrer
         X-Frame-Options DENY
-        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
     }
-    # Caddy flushes text/event-stream immediately by default. Do not buffer SSE.
-    encode gzip zstd
-    reverse_proxy 127.0.0.1:3000 {
-        flush_interval -1
+    # Terminal-only product: the public internet gets /health and nothing
+    # else. /chat is reachable solely through the SSH tunnel (loopback),
+    # so nobody else can spend this server's API credits.
+    handle /health {
+        reverse_proxy 127.0.0.1:3000
+    }
+    handle {
+        respond "Not found" 404
     }
 }

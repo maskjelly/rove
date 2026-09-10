@@ -4,15 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.9", features = ["multipart"] }
-chrono = "0.4.45"
-futures = "0.3.34"
-reqwest = { version = "0.13.5", features = ["json", "stream", "multipart"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-stream = "0.3"
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "time", "sync", "signal", "fs"] }
-tokio-stream = "0.1.19"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "time", "sync", "signal"] }
 
 
 

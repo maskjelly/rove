@@ -1,4 +1,4 @@
-use backend_rove::SseDecoder;
+use backend_rove::{MAX_BYTES, MAX_MESSAGES, SseDecoder};
 use serde_json::{Value, json};
 use std::{
     error::Error,
@@ -188,12 +188,12 @@ async fn run() -> Result<()> {
         }
         messages.push(json!({"role": "user", "content": input}));
         let mut trimmed = false;
-        while messages.len() > 21
+        while messages.len() > MAX_MESSAGES
             || messages
                 .iter()
                 .map(|m| m["content"].as_str().unwrap_or("").len())
                 .sum::<usize>()
-                > 24_000
+                > MAX_BYTES
         {
             messages.drain(..2);
             trimmed = true;

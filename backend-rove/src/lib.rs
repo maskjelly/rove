@@ -1,5 +1,10 @@
 /// Incremental SSE decoder. Buffer bytes until a complete event so UTF-8 split
 /// across network chunks stays intact. Supports LF, CRLF and multiline data.
+/// Shared conversation budget, enforced by the server and mirrored by the
+/// terminal client so valid input is never rejected.
+pub const MAX_MESSAGES: usize = 21;
+pub const MAX_BYTES: usize = 24_000;
+
 #[derive(Default)]
 pub struct SseDecoder {
     pending: Vec<u8>,
