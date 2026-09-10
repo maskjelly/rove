@@ -20,10 +20,27 @@ use tokio::sync::{Semaphore, broadcast};
 /// Live observer tap: every streamed line is teed here. `GET /tap` replays
 /// recent history then tails live, so any device (e.g. `curl` on a phone)
 /// can watch what flows between clients and the server.
+#[derive(Clone, Debug)]
+struct TapLine {
+    /// When the server handled the event (millis since epoch).
+    srv_ms: u64,
+    text: String,
+}
+
+impl TapLine {
+    fn now(text: String) -> Self {
+        let short: String = text.chars().take(300).collect();
+        Self {
+            srv_ms: now_ms(),
+            text: short,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Tap {
-    tx: broadcast::Sender<String>,
-    buf: Arc<std::sync::Mutex<VecDeque<String>>>,
+    tx: broadcast::Sender<TapLine>,
+    buf: Arc<std::sync::Mutex<VecDeque<TapLine>>>,
 }
 
 impl Tap {
@@ -35,7 +52,7 @@ impl Tap {
         }
     }
 
-    fn push(&self, line: String) {
+    fn push(&self, line: TapLine) {
         if let Ok(mut buf) = self.buf.lock() {
             buf.push_back(line.clone());
             while buf.len() > 500 {
@@ -45,7 +62,7 @@ impl Tap {
         let _ = self.tx.send(line);
     }
 
-    fn snapshot(&self) -> Vec<String> {
+    fn snapshot(&self) -> Vec<TapLine> {
         self.buf
             .lock()
             .map(|buf| buf.iter().cloned().collect())
@@ -53,28 +70,52 @@ impl Tap {
     }
 }
 
-fn stamp() -> String {
+fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let day = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-        % 86400;
-    format!("{:02}:{:02}:{:02}", day / 3600, day % 3600 / 60, day % 60)
 }
 
-fn tap_line(kind: &str, text: &str) -> String {
-    let short: String = text.chars().take(300).collect();
-    format!("[{}] {kind} {short}", stamp())
+fn stamp_ms(ms: u64) -> String {
+    let day = ms / 1000 % 86400;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        day / 3600,
+        day % 3600 / 60,
+        day % 60,
+        ms % 1000
+    )
+}
+
+/// Delivery lag (or replay age) in human form: the gap between the server
+/// handling a line and the observer receiving it.
+fn age_str(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else if ms < 3_600_000 {
+        format!("{}m", ms / 60_000)
+    } else {
+        format!("{}h", ms / 3_600_000)
+    }
+}
+
+fn format_tap_line(line: &TapLine, now: u64) -> String {
+    format!(
+        "[{} → +{}] {}",
+        stamp_ms(line.srv_ms),
+        age_str(now.saturating_sub(line.srv_ms)),
+        line.text
+    )
 }
 
 /// Human-readable one-liner for a streamed event. Protocol noise
-/// (item added/done bookkeeping, empty frames) renders to nothing.
+/// (item added/done bookkeeping, empty frames, raw text deltas) renders to
+/// nothing: text is coalesced into sentences elsewhere.
 fn render_tap_event(value: &Value) -> Option<String> {
-    let short = |text: &str| {
-        let short: String = text.chars().take(300).collect();
-        short
-    };
     match value.get("type")?.as_str()? {
         "response.created" => Some(format!(
             "· {} thinking…",
@@ -84,21 +125,6 @@ fn render_tap_event(value: &Value) -> Option<String> {
                 .as_str()
                 .unwrap_or("AI")
         )),
-        "response.reasoning_summary_text.delta" => value
-            .get("delta")?
-            .as_str()
-            .map(|d| format!("~ {}", short(d))),
-        "response.output_text.delta" | "response.refusal.delta" => {
-            value.get("delta")?.as_str().map(short)
-        }
-        "response.completed" => {
-            let usage = value.get("response")?.get("usage")?;
-            Some(format!(
-                "✓ done · {} in / {} out tokens",
-                usage.get("input_tokens")?,
-                usage.get("output_tokens")?
-            ))
-        }
         "response.incomplete" => Some("! stopped early (output limit)".into()),
         "response.failed" => Some("! model run failed".into()),
         "error" => Some(format!(
@@ -109,6 +135,61 @@ fn render_tap_event(value: &Value) -> Option<String> {
                 .unwrap_or("stream failed")
         )),
         _ => None,
+    }
+}
+
+/// Byte index where a sentence completes: punctuation followed by whitespace
+/// or end of buffer (so "3.5" and "e.g." don't split).
+fn sentence_end(buf: &str) -> Option<usize> {
+    let mut pending: Option<usize> = None;
+    for (i, c) in buf.char_indices() {
+        if let Some(end) = pending {
+            if c.is_whitespace() {
+                return Some(end);
+            }
+            pending = None;
+        }
+        if matches!(c, '.' | '!' | '?') {
+            pending = Some(i + c.len_utf8());
+            if i + c.len_utf8() == buf.len() {
+                return Some(buf.len());
+            }
+        }
+    }
+    None
+}
+
+/// Soft cut for very long fragments: last space within 160 chars, else a
+/// hard char-boundary cut.
+fn soft_cut(buf: &str) -> usize {
+    let cap = buf
+        .char_indices()
+        .take_while(|(i, _)| *i < 160)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
+        .max(1)
+        .min(buf.len());
+    buf[..cap].rfind(' ').map(|i| i + 1).unwrap_or(cap).max(1)
+}
+
+/// Drain complete sentences (or long fragments) from the buffer as tap lines.
+fn flush_tap_lines(tap: &Tap, buf: &mut String, force: bool) {
+    let rest = buf.trim_start().len();
+    buf.drain(..buf.len() - rest);
+    loop {
+        if buf.is_empty() {
+            break;
+        }
+        let end = sentence_end(buf).or_else(|| (force || buf.len() >= 160).then(|| soft_cut(buf)));
+        let Some(end) = end else { break };
+        let line: String = buf.drain(..end.min(buf.len())).collect();
+        let rest = buf.trim_start().len();
+        buf.drain(..buf.len() - rest);
+        let line = line.trim().to_string();
+        if !line.is_empty() {
+            tap.push(TapLine::now(format!("< {line}")));
+        }
     }
 }
 
@@ -304,11 +385,16 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
     let key: String = key.clone();
     let tap = state.tap.clone();
     if let Some(last) = request.messages.last() {
-        tap.push(tap_line(">", &last.content));
+        tap.push(TapLine::now(format!(
+            "> {}",
+            last.content.chars().take(300).collect::<String>()
+        )));
     }
     let stream = async_stream::stream! {
         // Held until completion or client disconnect; dropping this stream closes upstream.
         let _permit = permit;
+        // t=0 for every server-side tap latency below.
+        let received = std::time::Instant::now();
         // Idle keep-alive: without traffic, NATs and middleboxes can kill a
         // slow reasoning stream before the first token arrives.
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
@@ -325,7 +411,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 Some(response) => response,
                 None => {
                     if round >= MAX_TOOL_ROUNDS {
-                        tap.push(tap_line("!", "stopped after 8 tool steps"));
+                        tap.push(TapLine::now("! stopped after 8 tool steps".into()));
                         yield Ok::<_, Infallible>(sse_error("Stopped after 8 tool steps. Ask in smaller pieces."));
                         break 'rounds;
                     }
@@ -347,7 +433,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     {
                         Ok(response) if response.status().is_success() => response,
                         _ => {
-                            tap.push(tap_line("!", "follow-up model request failed"));
+                            tap.push(TapLine::now("! follow-up model request failed".into()));
                             yield Ok::<_, Infallible>(sse_error("The model request failed. Please try again."));
                             break 'rounds;
                         }
@@ -358,6 +444,11 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
             let mut decoder = SseDecoder::default();
             let mut output_items: Vec<Value> = Vec::new();
             let mut completed = false;
+            // Tap coalescing: fragments accumulate here and flush as readable
+            // sentence lines instead of one line per word.
+            let mut tap_answer = String::new();
+            let mut tap_reason = String::new();
+            let mut first_text = false;
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
@@ -372,29 +463,76 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                                 else {
                                     continue;
                                 };
-                                if let Some(line) = render_tap_event(&value)
-                                    && !line.trim().is_empty()
-                                {
-                                    tap.push(format!("[{}] < {line}", stamp()));
-                                }
-                                if value.get("type").and_then(|t| t.as_str())
-                                    == Some("response.completed")
-                                {
-                                    if let Some(output) = value
-                                        .get("response")
-                                        .and_then(|r| r.get("output"))
-                                        .and_then(|o| o.as_array())
-                                    {
-                                        output_items = output.clone();
+                                match value.get("type").and_then(|t| t.as_str()) {
+                                    Some(
+                                        "response.output_text.delta"
+                                        | "response.refusal.delta",
+                                    ) => {
+                                        if let Some(d) = value.get("delta").and_then(|d| d.as_str()) {
+                                            if !first_text {
+                                                first_text = true;
+                                                tap.push(TapLine::now(format!(
+                                                    "· first answer +{}ms after receipt",
+                                                    received.elapsed().as_millis()
+                                                )));
+                                            }
+                                            tap_answer.push_str(d);
+                                        }
+                                        flush_tap_lines(&tap, &mut tap_answer, false);
                                     }
-                                    completed = true;
+                                    Some("response.reasoning_summary_text.delta") => {
+                                        if let Some(d) = value.get("delta").and_then(|d| d.as_str()) {
+                                            tap_reason.push_str(d);
+                                        }
+                                    }
+                                    Some("response.reasoning_summary_text.done") => {
+                                        let text = tap_reason.trim().to_string();
+                                        tap_reason.clear();
+                                        if !text.is_empty() {
+                                            tap.push(TapLine::now(format!("~ {text}")));
+                                        }
+                                    }
+                                    Some("response.completed") => {
+                                        flush_tap_lines(&tap, &mut tap_answer, true);
+                                        let reason = tap_reason.trim().to_string();
+                                        tap_reason.clear();
+                                        if !reason.is_empty() {
+                                            tap.push(TapLine::now(format!("~ {reason}")));
+                                        }
+                                        if let Some(output) = value
+                                            .get("response")
+                                            .and_then(|r| r.get("output"))
+                                            .and_then(|o| o.as_array())
+                                        {
+                                            output_items = output.clone();
+                                        }
+                                        completed = true;
+                                        if let Some(usage) = value
+                                            .get("response")
+                                            .and_then(|r| r.get("usage"))
+                                        {
+                                            tap.push(TapLine::now(format!(
+                                                "✓ done · {} in / {} out · {}ms server",
+                                                usage.get("input_tokens").map(|v| v.to_string()).as_deref().unwrap_or("?"),
+                                                usage.get("output_tokens").map(|v| v.to_string()).as_deref().unwrap_or("?"),
+                                                received.elapsed().as_millis()
+                                            )));
+                                        }
+                                    }
+                                    _ => {
+                                        if let Some(line) = render_tap_event(&value)
+                                            && !line.trim().is_empty()
+                                        {
+                                            tap.push(TapLine::now(format!("< {line}")));
+                                        }
+                                    }
                                 }
                             }
                             yield Ok(bytes);
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            tap.push(tap_line("!", "upstream stream interrupted"));
+                            tap.push(TapLine::now("! upstream stream interrupted".into()));
                             yield Ok::<_, Infallible>(sse_error("Upstream stream interrupted; please retry."));
                             break 'rounds;
                         }
@@ -421,10 +559,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     .and_then(|args| args.get("command")?.as_str().map(str::to_string))
                     .unwrap_or_default();
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.call", "command": command})));
-                tap.push(format!("[{}] $ {command}", stamp()));
+                tap.push(TapLine::now(format!("$ {command}")));
                 let (code, output, ms) = run_command(&command).await;
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.done", "exit": code, "ms": ms})));
-                tap.push(format!("[{0}] [exit {code} · {ms}ms]", stamp()));
+                tap.push(TapLine::now(format!("[exit {code} · {ms}ms]")));
                 turn.push(json!({"type": "function_call_output", "call_id": call_id, "output": output}));
             }
             turn_input = turn;
@@ -448,18 +586,20 @@ async fn tap(
     if let Some(n) = params.get("tail").and_then(|v| v.parse::<usize>().ok()) {
         let lines = state.tap.snapshot();
         let from = lines.len().saturating_sub(n.min(500));
-        return (
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            lines[from..].join("\n") + "\n",
-        )
-            .into_response();
+        let now = now_ms();
+        let body: String = lines[from..]
+            .iter()
+            .map(|line| format_tap_line(line, now) + "\n")
+            .collect();
+        return ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response();
     }
     let tap = state.tap.clone();
     // Plain-text streaming (not SSE framing): observers watch with plain
     // `curl -N`, so lines arrive exactly as shown, with no `data:` noise.
     let stream = async_stream::stream! {
+        let now = now_ms();
         for line in tap.snapshot() {
-            yield Ok::<_, Infallible>(axum::body::Bytes::from(format!("{line}\n")));
+            yield Ok::<_, Infallible>(axum::body::Bytes::from(format_tap_line(&line, now) + "\n"));
         }
         let mut rx = tap.tx.subscribe();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
@@ -469,7 +609,7 @@ async fn tap(
             tokio::select! {
                 _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b"\n")),
                 got = rx.recv() => match got {
-                    Ok(line) => yield Ok(axum::body::Bytes::from(format!("{line}\n"))),
+                    Ok(line) => yield Ok(axum::body::Bytes::from(format_tap_line(&line, now_ms()) + "\n")),
                     Err(_) => break,
                 },
             }
