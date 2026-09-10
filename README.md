@@ -11,11 +11,10 @@ From this repository:
 cargo run --manifest-path backend-rove/Cargo.toml --bin client
 ```
 
-The client automatically opens an encrypted SSH tunnel using your existing
-`ssh rove` configuration. No OpenAI key is needed on your laptop.
-Pass a base URL as the first argument to skip the tunnel, e.g.
-`http://127.0.0.1:3000` for local development.
-Use `ROVE_SSH_HOST=other-host` to select a different SSH alias.
+The client talks straight to the server. No SSH, no tunnel, no OpenAI key
+on your laptop — it sends text and prints the streamed response.
+Pass a base URL as the first argument to override the default
+(`https://45.196.196.251`), e.g. `http://127.0.0.1:3000` for local development.
 
 Type a message and press Enter. Answers and supported reasoning summaries print
 as they arrive. `/new` resets the conversation; `/exit` (or `/quit`) quits; Ctrl-C cancels and exits.
@@ -33,9 +32,7 @@ is chat only: it has no shell, file editing, or autonomous tool execution.
 
 `POST /chat` takes `{"messages":[{"role":"user","content":"Hello"}]}` and
 streams OpenAI Responses SSE events back. `GET /health` returns `ok`.
-Only loopback clients are served; direct plain-HTTP chat on port 3000 from
-anywhere else is rejected, so use the SSH tunnel. Over public HTTPS only
-`/health` is exposed; `/chat` never leaves the machine.
+The server accepts chat requests directly and streams the answer back.
 
 Root-only `/etc/rove.env` supplies `OPENAI_API_KEY` and `OPENAI_MODEL` to systemd.
 Default: `gpt-5-mini`, low reasoning effort, automatic reasoning summaries,

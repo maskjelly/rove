@@ -7,17 +7,10 @@ https://45.196.196.251 {
     }
     header {
         X-Content-Type-Options nosniff
-        Referrer-Policy no-referrer
         X-Frame-Options DENY
-        Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
     }
-    # Terminal-only product: the public internet gets /health and nothing
-    # else. /chat is reachable solely through the SSH tunnel (loopback),
-    # so nobody else can spend this server's API credits.
-    handle /health {
-        reverse_proxy 127.0.0.1:3000
-    }
-    handle {
-        respond "Not found" 404
+    encode gzip zstd
+    reverse_proxy 127.0.0.1:3000 {
+        flush_interval -1
     }
 }

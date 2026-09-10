@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -9,7 +9,7 @@ use axum::{
 use backend_rove::{MAX_BYTES, MAX_MESSAGES};
 use serde::Deserialize;
 use serde_json::json;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 #[derive(Clone)]
@@ -36,16 +36,7 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": message}))).into_response()
 }
 
-async fn chat(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<ChatRequest>,
-) -> Response {
-    // Only loopback may chat: the terminal client connects through `ssh rove`
-    // (or explicitly passes a base URL). Never trust forwarded headers.
-    if !peer.ip().is_loopback() {
-        return error(StatusCode::FORBIDDEN, "Connect through the SSH client.");
-    }
+async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -> Response {
     let Some(key) = &state.key else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -186,10 +177,7 @@ async fn main() {
         .await
         .expect("bind server");
     println!("Rove listening on {addr}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .expect("serve requests");
+    axum::serve(listener, app.into_make_service())
+        .await
+        .expect("serve requests");
 }

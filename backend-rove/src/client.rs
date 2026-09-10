@@ -3,57 +3,17 @@ use serde_json::{Value, json};
 use std::{
     error::Error,
     io::{self, Write},
-    net::TcpListener,
-    process::{Child, Command, Stdio},
     time::Duration,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-struct Tunnel(Child);
-impl Drop for Tunnel {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-async fn connect(http: &reqwest::Client) -> Result<(String, Option<Tunnel>)> {
-    if let Some(base) = std::env::args().nth(1) {
-        return Ok((base.trim_end_matches('/').to_string(), None));
-    }
-    let socket = TcpListener::bind("127.0.0.1:0")?;
-    let port = socket.local_addr()?.port();
-    drop(socket);
-    let host = std::env::var("ROVE_SSH_HOST").unwrap_or_else(|_| "rove".into());
-    println!("Connecting securely through ssh {host} ...");
-    let mut tunnel = Tunnel(
-        Command::new("ssh")
-            .args([
-                "-N",
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-L",
-            ])
-            .arg(format!("127.0.0.1:{port}:127.0.0.1:3000"))
-            .arg(host)
-            .stdin(Stdio::null())
-            .spawn()?,
-    );
-    let base = format!("http://127.0.0.1:{port}");
+async fn connect(http: &reqwest::Client) -> Result<String> {
+    let base = std::env::args()
+        .nth(1)
+        .map(|b| b.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "https://45.196.196.251".to_string());
     for _ in 0..100 {
-        if tunnel.0.try_wait()?.is_some() {
-            return Err("SSH tunnel failed. Check that `ssh rove` works.".into());
-        }
         if let Ok(response) = http
             .get(format!("{base}/health"))
             .timeout(Duration::from_secs(1))
@@ -61,11 +21,11 @@ async fn connect(http: &reqwest::Client) -> Result<(String, Option<Tunnel>)> {
             .await
             && response.status().is_success()
         {
-            return Ok((base, Some(tunnel)));
+            return Ok(base);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err("Server did not become reachable through SSH.".into())
+    Err(format!("Server did not become reachable at {base}.").into())
 }
 
 async fn response(http: &reqwest::Client, base: &str, messages: &[Value]) -> Result<String> {
@@ -149,7 +109,7 @@ async fn run() -> Result<()> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(200))
         .build()?;
-    let (base, _tunnel) = connect(&http).await?;
+    let base = connect(&http).await?;
     println!("Rove chat · /new clears history · /exit quits · Ctrl-C cancels and exits");
     println!(
         "Conversation stays in this client session. Recent turns are sent with each message.\n"

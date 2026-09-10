@@ -38,9 +38,7 @@ Uncommitted code is never deployed. Push application code separately when ready.
 Changes to the deployment scripts/service require reinstalling them on the server;
 the workflow deploys application code only.
 
-Caddy exposes `GET /health` to the public internet and answers 404 to
-everything else at https://45.196.196.251. `POST /chat` is reachable only
-through the SSH tunnel, so nobody else can spend this server's API credits.
+Caddy proxies https://45.196.196.251 to the server on port 3000.
 `deploy/Caddyfile` is installed
 at `/etc/caddy/Caddyfile`; install changes there, validate with
 `caddy validate`, then `systemctl reload caddy`. Caddy automatically renews the
