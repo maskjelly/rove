@@ -22,25 +22,33 @@ use tokio::sync::{Semaphore, broadcast};
 /// can watch what flows between clients and the server.
 #[derive(Clone, Debug)]
 struct TapLine {
-    /// When the server handled the event (millis since epoch).
+    /// Wall-clock time (human reference; may stutter on sick VM clocks).
     srv_ms: u64,
+    /// Monotonic ms since the previous pushed line: the trustworthy timeline.
+    gap_ms: u64,
     text: String,
 }
 
 impl TapLine {
-    fn now(text: String) -> Self {
+    fn now(text: String, gap_ms: u64) -> Self {
         let short: String = text.chars().take(300).collect();
         Self {
             srv_ms: now_ms(),
+            gap_ms,
             text: short,
         }
     }
 }
 
+struct TapInner {
+    buf: VecDeque<TapLine>,
+    last_push: std::time::Instant,
+}
+
 #[derive(Clone)]
 struct Tap {
     tx: broadcast::Sender<TapLine>,
-    buf: Arc<std::sync::Mutex<VecDeque<TapLine>>>,
+    inner: Arc<std::sync::Mutex<TapInner>>,
 }
 
 impl Tap {
@@ -48,24 +56,33 @@ impl Tap {
         let (tx, _) = broadcast::channel(512);
         Self {
             tx,
-            buf: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            inner: Arc::new(std::sync::Mutex::new(TapInner {
+                buf: VecDeque::new(),
+                last_push: std::time::Instant::now(),
+            })),
         }
     }
 
-    fn push(&self, line: TapLine) {
-        if let Ok(mut buf) = self.buf.lock() {
-            buf.push_back(line.clone());
-            while buf.len() > 500 {
-                buf.pop_front();
+    fn push(&self, text: String) {
+        let line = if let Ok(mut inner) = self.inner.lock() {
+            let gap_ms = inner.last_push.elapsed().as_millis() as u64;
+            inner.last_push = std::time::Instant::now();
+            let line = TapLine::now(text, gap_ms);
+            inner.buf.push_back(line.clone());
+            while inner.buf.len() > 500 {
+                inner.buf.pop_front();
             }
-        }
+            line
+        } else {
+            return;
+        };
         let _ = self.tx.send(line);
     }
 
     fn snapshot(&self) -> Vec<TapLine> {
-        self.buf
+        self.inner
             .lock()
-            .map(|buf| buf.iter().cloned().collect())
+            .map(|inner| inner.buf.iter().cloned().collect())
             .unwrap_or_default()
     }
 }
@@ -104,9 +121,13 @@ fn age_str(ms: u64) -> String {
 }
 
 fn format_tap_line(line: &TapLine, now: u64) -> String {
+    // Wall time for human reference, mono gap-since-previous-line for the
+    // trustworthy timeline (wall clocks can stutter on sick VMs), delivery
+    // age for observer lag.
     format!(
-        "[{} → +{}] {}",
+        "[{} (+{} mono) → +{}] {}",
         stamp_ms(line.srv_ms),
+        age_str(line.gap_ms),
         age_str(now.saturating_sub(line.srv_ms)),
         line.text
     )
@@ -188,7 +209,7 @@ fn flush_tap_lines(tap: &Tap, buf: &mut String, force: bool) {
         buf.drain(..buf.len() - rest);
         let line = line.trim().to_string();
         if !line.is_empty() {
-            tap.push(TapLine::now(format!("< {line}")));
+            tap.push(format!("< {line}"));
         }
     }
 }
@@ -426,10 +447,10 @@ impl TapFeed<'_> {
                     if let Some(d) = value.get("delta").and_then(|d| d.as_str()) {
                         if !self.first_text {
                             self.first_text = true;
-                            self.tap.push(TapLine::now(format!(
+                            self.tap.push(format!(
                                 "· first answer +{}ms after receipt",
                                 self.received.elapsed().as_millis()
-                            )));
+                            ));
                         }
                         self.answer.push_str(d);
                     }
@@ -444,7 +465,7 @@ impl TapFeed<'_> {
                     let text = self.reason.trim().to_string();
                     self.reason.clear();
                     if !text.is_empty() {
-                        self.tap.push(TapLine::now(format!("~ {text}")));
+                        self.tap.push(format!("~ {text}"));
                     }
                 }
                 Some("response.completed") => {
@@ -458,7 +479,7 @@ impl TapFeed<'_> {
                     }
                     *completed = true;
                     if let Some(usage) = value.get("response").and_then(|r| r.get("usage")) {
-                        self.tap.push(TapLine::now(format!(
+                        self.tap.push(format!(
                             "✓ done · {} in / {} out · {}ms server",
                             usage
                                 .get("input_tokens")
@@ -471,14 +492,14 @@ impl TapFeed<'_> {
                                 .as_deref()
                                 .unwrap_or("?"),
                             self.received.elapsed().as_millis()
-                        )));
+                        ));
                     }
                 }
                 _ => {
                     if let Some(line) = render_tap_event(&value)
                         && !line.trim().is_empty()
                     {
-                        self.tap.push(TapLine::now(format!("< {line}")));
+                        self.tap.push(format!("< {line}"));
                     }
                 }
             }
@@ -490,7 +511,7 @@ impl TapFeed<'_> {
         let reason = self.reason.trim().to_string();
         self.reason.clear();
         if !reason.is_empty() {
-            self.tap.push(TapLine::now(format!("~ {reason}")));
+            self.tap.push(format!("~ {reason}"));
         }
     }
 }
@@ -605,10 +626,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
     let key: String = key.clone();
     let tap = state.tap.clone();
     if let Some(last) = request.messages.last() {
-        tap.push(TapLine::now(format!(
+        tap.push(format!(
             "> {}",
             last.content.chars().take(300).collect::<String>()
-        )));
+        ));
     }
     let stream = async_stream::stream! {
         // Held until completion or client disconnect; dropping this stream closes upstream.
@@ -630,12 +651,13 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         });
         let mut turn_input = Vec::new();
         let mut round: u8 = 0;
+        let mut hs_waited = hs_waited0;
         'rounds: loop {
             let head = match pending.take() {
                 Some(head) => head,
                 None => {
                     if round >= MAX_TOOL_ROUNDS {
-                        tap.push(TapLine::now("! stopped after 8 tool steps".into()));
+                        tap.push("! stopped after 8 tool steps".into());
                         yield Ok::<_, Infallible>(sse_error("Stopped after 8 tool steps. Ask in smaller pieces."));
                         break 'rounds;
                     }
@@ -648,15 +670,19 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     {
                         Ok(template) => template,
                         Err(_) => {
-                            tap.push(TapLine::now("! follow-up model request failed".into()));
+                            tap.push("! follow-up model request failed".into());
                             yield Ok::<_, Infallible>(sse_error("The model request failed. Please try again."));
                             break 'rounds;
                         }
                     };
+                    let hs_t0 = std::time::Instant::now();
                     match hedge_send(&http, template).await {
-                        Ok(head) if head.response.status().is_success() => head,
+                        Ok(head) if head.response.status().is_success() => {
+                            hs_waited = hs_t0.elapsed().as_millis() as u64;
+                            head
+                        }
                         _ => {
-                            tap.push(TapLine::now("! follow-up model request failed".into()));
+                            tap.push("! follow-up model request failed".into());
                             yield Ok::<_, Infallible>(sse_error("The model request failed. Please try again."));
                             break 'rounds;
                         }
@@ -670,9 +696,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 hedged,
             } = head;
             if hedged {
-                tap.push(TapLine::now(format!(
-                    "⇄ hedged retry fired (+{hs_waited0}ms hedge)"
-                )));
+                tap.push(format!("⇄ hedged retry fired (+{hs_waited}ms hedge)"));
             }
             let mut decoder = SseDecoder::default();
             let mut output_items: Vec<Value> = Vec::new();
@@ -699,7 +723,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            tap.push(TapLine::now("! upstream stream interrupted".into()));
+                            tap.push("! upstream stream interrupted".into());
                             yield Ok::<_, Infallible>(sse_error("Upstream stream interrupted; please retry."));
                             break 'rounds;
                         }
@@ -727,10 +751,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     .and_then(|args| args.get("command")?.as_str().map(str::to_string))
                     .unwrap_or_default();
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.call", "command": command})));
-                tap.push(TapLine::now(format!("$ {command}")));
+                tap.push(format!("$ {command}"));
                 let (code, output, ms) = run_command(&command).await;
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.done", "exit": code, "ms": ms})));
-                tap.push(TapLine::now(format!("[exit {code} · {ms}ms]")));
+                tap.push(format!("[exit {code} · {ms}ms]"));
                 turn.push(json!({"type": "function_call_output", "call_id": call_id, "output": output}));
             }
             turn_input = turn;
