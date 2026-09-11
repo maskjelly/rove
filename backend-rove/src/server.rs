@@ -713,6 +713,13 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 yield Ok::<_, Infallible>(bytes);
             }
             loop {
+                // `completed` ends the round: anything after it is just
+                // [DONE]/keepalive. Never wait on upstream EOF — a peer that
+                // holds the connection open would wedge the turn (and the
+                // client's read) until timeouts fire.
+                if completed {
+                    break;
+                }
                 tokio::select! {
                     _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
                     chunk = upstream.chunk() => match chunk {
