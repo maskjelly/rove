@@ -4,11 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Web framework: routing, JSON extractors, SSE responses.
+# Trimmed to http1+json+query+tokio (everything else we don't serve).
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+# HTTP client for OpenAI: json bodies + streaming response chunks.
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
+# Derive macros auto-generate JSON parsing for our structs.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `stream!` macro: write a streaming response body as a simple loop with `yield`.
 async-stream = "0.3"
+# Async runtime. Features are opt-in: macros (#[tokio::main|test]),
+# net (TCP listener), rt (multithreaded scheduler), time (sleep/timeout),
+# sync (semaphore, channels), signal (Ctrl-C), process (spawning sh).
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "time", "sync", "signal", "process"] }
 
 

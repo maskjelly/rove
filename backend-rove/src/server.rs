@@ -1,8 +1,23 @@
+//! Rove server: `POST /chat` relays text to OpenAI and streams the answer
+//! back as SSE, with a `run_command` tool loop and a plain-text observer
+//! tap (`GET /tap`). Read `lib.rs`, then `client.rs`, then this file.
+//!
+//! The two Rust ideas that unlock this file:
+//! 1. *Ownership*: every value has one owner; passing it to another function
+//!    *moves* it unless you borrow (`&`). The compiler rejects use-after-move.
+//! 2. *Async*: `.await` pauses a task (not a thread) until I/O completes, so
+//!    thousands of requests share a few threads via the tokio runtime.
+
 use axum::{
-    Json, Router,
+    // axum maps HTTP to async functions: `Router` + `get`/`post` wire paths,
+    // `Json` parses/serializes request/response bodies, `State` shares the
+    // `AppState` below with every handler, `DefaultBodyLimit` caps uploads.
+    Json,
+    Router,
     body::Body,
     extract::{DefaultBodyLimit, State},
     http::{StatusCode, header},
+    // `IntoResponse` converts many types (tuples, strings, JSON) into HTTP.
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -45,8 +60,18 @@ struct TapInner {
     last_push: std::time::Instant,
 }
 
+/// The tap handle cloned into every request handler.
+///
+/// Rust lesson: `#[derive(Clone)]` here is *shallow* — cloning a `Tap`
+/// copies the `Arc` pointer, not the data. `Arc` (atomic reference count)
+/// lets many owners share one allocation across threads/tasks, and `Mutex`
+/// allows only one task inside at a time. A plain `std` mutex (not tokio's)
+/// is right because the critical section never awaits: lock, push, unlock.
 #[derive(Clone)]
 struct Tap {
+    // `broadcast` is a multi-producer, multi-consumer channel: every `send`
+    // reaches *all* live subscribers (each `/tap` tail holds one `Receiver`).
+    // Slow readers get a `Lagged` error instead of slowing the sender.
     tx: broadcast::Sender<TapLine>,
     inner: Arc<std::sync::Mutex<TapInner>>,
 }
@@ -64,6 +89,9 @@ impl Tap {
     }
 
     fn push(&self, text: String) {
+        // `&self` (not `&mut self`): interior mutability via the Mutex means
+        // even a shared reference can update the buffer. `if let Ok(...)`
+        // treats a poisoned lock as "drop the line" rather than panicking.
         let line = if let Ok(mut inner) = self.inner.lock() {
             let gap_ms = inner.last_push.elapsed().as_millis() as u64;
             inner.last_push = std::time::Instant::now();
@@ -92,6 +120,8 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
+        // `as u64` truncates; millis-since-epoch fits for millennia. Wall
+        // time can jump (NTP), so intervals always use `Instant` instead.
         .unwrap_or(0)
 }
 
@@ -136,6 +166,11 @@ fn format_tap_line(line: &TapLine, now: u64) -> String {
 /// Human-readable one-liner for a streamed event. Protocol noise
 /// (item added/done bookkeeping, empty frames, raw text deltas) renders to
 /// nothing: text is coalesced into sentences elsewhere.
+///
+/// Rust lesson: returning `Option<String>` instead of `String` lets the
+/// caller skip noise with `if let Some(line) = ...`. The `?` operator works
+/// here too — inside an `Option`-returning function, `None` propagates just
+/// like `Err` does in `Result` functions.
 fn render_tap_event(value: &Value) -> Option<String> {
     match value.get("type")?.as_str()? {
         "response.created" => Some(format!(
@@ -161,6 +196,11 @@ fn render_tap_event(value: &Value) -> Option<String> {
 
 /// Byte index where a sentence completes: punctuation followed by whitespace
 /// or end of buffer (so "3.5" and "e.g." don't split).
+///
+/// Rust lesson: `char_indices()` yields `(byte_index, char)` pairs because
+/// UTF-8 characters take 1–4 bytes — you must never slice a `&str` at an
+/// arbitrary byte offset (it panics). `c.len_utf8()` advances past the
+/// current character safely.
 fn sentence_end(buf: &str) -> Option<usize> {
     let mut pending: Option<usize> = None;
     for (i, c) in buf.char_indices() {
@@ -195,6 +235,12 @@ fn soft_cut(buf: &str) -> usize {
 }
 
 /// Drain complete sentences (or long fragments) from the buffer as tap lines.
+///
+/// Rust lesson: `buf.drain(..end)` removes a range *and* hands back the
+/// removed part — but the range end must sit on a character boundary or it
+/// panics at runtime. Every index here comes from `char_indices` (or an
+/// ASCII space from `rfind(' ')`, which is always boundary-safe), and the
+/// `.min(buf.len())` is belt-and-braces.
 fn flush_tap_lines(tap: &Tap, buf: &mut String, force: bool) {
     let rest = buf.trim_start().len();
     buf.drain(..buf.len() - rest);
@@ -220,10 +266,16 @@ struct AppState {
     key: Option<String>,
     model: String,
     endpoint: String,
+    // At most 8 turns run at once; the 9th gets HTTP 429 immediately instead
+    // of queueing (fail fast beats slow death). `Arc` shares one semaphore
+    // across all handler tasks.
     slots: Arc<Semaphore>,
     tap: Tap,
 }
 
+/// `#[derive(Deserialize)]` auto-generates JSON parsing for these structs:
+/// a request body of `{"role": ..., "content": ...}` becomes a `Message`.
+/// Unknown JSON fields are ignored; missing ones are a 400 error.
 #[derive(Deserialize)]
 struct Message {
     role: String,
@@ -261,16 +313,26 @@ fn exec_tool_def() -> Value {
 
 /// Run one shell command. Secrets are scrubbed from the child environment;
 /// output is capped; overruns are killed.
+///
+/// Rust lesson: `async fn` returning a plain tuple — no `Result` needed
+/// because every failure mode is encoded *in* the tuple (negative exit
+/// code + message). Callers never have to handle an error case here.
 async fn run_command(command: &str) -> (i32, String, u64) {
     let start = std::time::Instant::now();
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
+        // Pipes, not inheritance: without these the child would write into
+        // OUR stdout (we learned this the embarrassing way — a unit test
+        // caught `echo hi` leaking into the test runner's output).
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // `env_clear` wipes the parent environment (which holds the OpenAI
+        // key) before adding back a minimal PATH.
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        // If our future is dropped (timeout below), take the child with it.
         .kill_on_drop(true);
     let spawned = cmd.spawn();
     let ms = || start.elapsed().as_millis() as u64;
@@ -306,6 +368,8 @@ async fn run_command(command: &str) -> (i32, String, u64) {
 }
 
 fn sse_error(message: &str) -> axum::body::Bytes {
+    // SSE framing by hand: an optional `event:` line, then `data:`, then a
+    // blank line to dispatch. The client only looks at `data:` lines.
     axum::body::Bytes::from(format!(
         "event: error\ndata: {}\n\n",
         json!({"type": "error", "message": message})
@@ -345,6 +409,11 @@ fn stashed(
 /// Send with hedging across both stall phases: slow response headers AND
 /// slow first body byte each trigger a twin race after the hedge delay.
 /// Non-success statuses return immediately (a twin would fail identically).
+///
+/// Rust lesson: `Box::pin` puts a future at a stable memory address so
+/// `select!` can poll it. Futures that borrow data can't be moved after
+/// polling starts — pinning plus *owned* values (see `first_chunk` below)
+/// is the standard escape hatch.
 async fn hedge_send(
     http: &reqwest::Client,
     template: reqwest::Request,
@@ -352,6 +421,9 @@ async fn hedge_send(
     let mut twin_template = template.try_clone();
     let mut primary_fut = Box::pin(http.execute(template));
     // Phase 1: first response headers win.
+    // `biased` polls branches top-to-bottom, so an already-ready primary
+    // wins ties and we never waste a twin. The `if` guard disables the
+    // sleep branch entirely when there is no twin to fire.
     let mut primary = tokio::select! {
         biased;
         result = &mut primary_fut => result?,
@@ -419,6 +491,12 @@ async fn first_chunk(
 
 /// Tap coalescing state for one upstream stream: fragments accumulate and
 /// flush as readable sentence lines instead of one line per word.
+///
+/// Rust lesson: the `<'a>` is a *lifetime* — it tells the compiler "this
+/// struct borrows a `Tap` that must outlive the struct". `&'a Tap` borrows
+/// (no clone needed for a shared handle), while `answer`/`reason` are owned
+/// `String`s because this struct builds them up itself. `Instant` is `Copy`,
+/// so it moves by value with no ownership fuss.
 struct TapFeed<'a> {
     tap: &'a Tap,
     answer: String,
@@ -517,6 +595,8 @@ impl TapFeed<'_> {
 }
 
 fn round_payload(model: &str, instructions: &str, input: &[Value], tools: &Value) -> Value {
+    // `&[Value]` is a slice: works for `Vec` and arrays alike, borrowed.
+    // `json!` is a macro that builds `serde_json::Value` from JSON-like syntax.
     json!({
         "model": model,
         "instructions": instructions,
@@ -531,6 +611,12 @@ fn round_payload(model: &str, instructions: &str, input: &[Value], tools: &Value
 }
 
 async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -> Response {
+    // axum *extractors* in the signature do the HTTP plumbing: `State`
+    // clones out the shared `AppState`, `Json` parses the body (rejecting
+    // malformed JSON with 400/415 before this code runs).
+    // `let ... else` (Rust 1.65+): unwrap the `Some` case into `key`, or
+    // `return`/`break`/`continue` out of the function on `None`. It reads
+    // like an early return and avoids one level of nesting.
     let Some(key) = &state.key else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -555,6 +641,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
             "Send 1–21 user/assistant messages, up to 24 KB, ending with a user message.",
         );
     }
+    // `try_acquire_owned` never waits: at capacity it errors instantly and
+    // the caller gets 429 + `Retry-After` instead of hanging in a queue.
+    // The owned permit is moved into the stream below, so the slot frees
+    // exactly when the response ends (or the client disconnects).
     let Ok(permit) = state.slots.clone().try_acquire_owned() else {
         return (
             [(header::RETRY_AFTER, "2")],
@@ -573,14 +663,15 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
     let tools = json!([exec_tool_def()]);
     let instructions = "You are Rove, a terse assistant with a run_command tool for operating this server (30s limit). Probe read-only first. Be concise.";
     // Stamp receipt BEFORE any upstream work: this is t=0 of the turn.
+    // (No truncation here — `TapLine::now` already caps line length.)
     let tap = state.tap.clone();
     if let Some(last) = request.messages.last() {
-        tap.push(format!(
-            "> {}",
-            last.content.chars().take(300).collect::<String>()
-        ));
+        tap.push(format!("> {}", last.content));
     }
     let payload = round_payload(&state.model, instructions, &input, &tools);
+    // `.build()` turns the request builder into a concrete `Request` *without*
+    // sending it, so `try_clone()` can mint an identical twin for hedging.
+    // (A body built from bytes is cloneable; a streaming body would not be.)
     let template = match state
         .http
         .post(&state.endpoint)
@@ -597,6 +688,8 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         }
     };
     let hs_t0 = std::time::Instant::now();
+    // Wall-clock stamp of the hedge duration goes on the tap line later, so
+    // slow starts are visible per turn.
     let HeadStart {
         response: upstream,
         stash,
@@ -628,7 +721,9 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         return error(StatusCode::BAD_GATEWAY, message);
     }
     // The SSE stream must be 'static: hand it owned copies of everything.
-    // (`tap` was cloned above for the receipt stamp.)
+    // (`tap` was cloned above for the receipt stamp.) Anything merely
+    // borrowed from this stack frame would dangle once the handler returns
+    // while the stream is still being polled — the compiler rejects that.
     let http = state.http.clone();
     let endpoint = state.endpoint.clone();
     let model = state.model.clone();
@@ -645,7 +740,8 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         heartbeat.tick().await;
         // First round reuses the already-sent request above so its HTTP errors
         // keep their status codes; later rounds failed mid-stream become SSE
-        // error events instead.
+        // error events instead. (`Option::take` swaps in `None` and hands us
+        // the value — the standard "move out and leave empty" idiom.)
         let mut pending: Option<HeadStart> = Some(HeadStart {
             response: upstream,
             stash,
@@ -740,6 +836,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 }
             }
             feed.finish();
+            // Collect this round's function calls, if any. `filter` keeps
+            // matching items; `filter_map` keeps *and* transforms, dropping
+            // `None`s — here a missing `call_id` discards a malformed item.
+            // The `?`s work because the closure returns `Option`.
             let calls: Vec<(String, String)> = output_items
                 .iter()
                 .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
@@ -755,6 +855,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
             }
             let mut turn = output_items;
             for (call_id, arguments) in calls {
+                // Parse the model's requested command out of its JSON arguments.
                 let command = serde_json::from_str::<Value>(&arguments)
                     .ok()
                     .and_then(|args| args.get("command")?.as_str().map(str::to_string))
@@ -764,6 +865,10 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 let (code, output, ms) = run_command(&command).await;
                 yield Ok::<_, Infallible>(sse_event(&json!({"type": "exec.done", "exit": code, "ms": ms})));
                 tap.push(format!("[exit {code} · {ms}ms]"));
+                // Feed the result back so the model can continue with it.
+                // This is the Responses API contract: every `function_call`
+                // output item must be answered by a `function_call_output`
+                // item carrying the same `call_id`.
                 turn.push(json!({"type": "function_call_output", "call_id": call_id, "output": output}));
             }
             turn_input = turn;
@@ -781,6 +886,8 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
 
 async fn tap(
     State(state): State<AppState>,
+    // `Query<HashMap<..>>` parses `?tail=50` into a map; a missing or
+    // non-numeric value simply takes the streaming branch below.
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
     // ?tail=N peeks at recent history and closes; plain GET streams live.
@@ -808,9 +915,13 @@ async fn tap(
         heartbeat.tick().await;
         loop {
             tokio::select! {
+                // Blank line, not an SSE comment: this stream is plain text,
+                // so anything visible would show up in observers' terminals.
                 _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b"\n")),
                 got = rx.recv() => match got {
                     Ok(line) => yield Ok(axum::body::Bytes::from(format_tap_line(&line, now_ms()) + "\n")),
+                    // `Lagged` (slow reader fell behind) and `Closed` both
+                    // end the stream; the observer just reconnects.
                     Err(_) => break,
                 },
             }
@@ -828,6 +939,9 @@ async fn tap(
 
 #[tokio::main]
 async fn main() {
+    // One shared HTTP client for the process: connection pooling means the
+    // second request to OpenAI reuses the warm TLS connection. The 180s
+    // `timeout` is a *total* deadline per request, streaming included.
     let state = AppState {
         http: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -866,6 +980,8 @@ async fn main() {
 mod tests {
     use super::*;
 
+    // `#[tokio::test]` is the async version of `#[test]`: it builds a
+    // runtime so the test body can `.await`. These spawn a real `sh`.
     #[tokio::test]
     async fn exec_runs_and_reports() {
         let (code, output, _) = run_command("echo hi").await;
@@ -878,5 +994,20 @@ mod tests {
         let (code, output, _) = run_command("exit 3").await;
         assert_eq!(code, 3);
         assert!(output.contains("exit 3"));
+    }
+
+    // Pure functions get plain synchronous tests: no I/O, no runtime needed.
+    #[test]
+    fn sentence_boundaries() {
+        // Punctuation + space ends a sentence; decimals and abbreviations don't.
+        assert_eq!(sentence_end("Hi there. How are you?"), Some(9));
+        assert_eq!(sentence_end("Pi is 3.5 today"), None);
+        assert_eq!(sentence_end("Hi."), Some(3));
+        assert_eq!(sentence_end("no punctuation"), None);
+        // Long fragments cut at a space, never mid-character.
+        let long = "word ".repeat(50);
+        let cut = soft_cut(&long);
+        assert!(cut <= 160 && long.is_char_boundary(cut));
+        assert!(long[..cut].ends_with(' '));
     }
 }

@@ -77,5 +77,18 @@ Pushes to `main` run tests, build the client/server, exercise streaming against 
 local mock without spending API credits, then deploy to the VPS. See
 [deployment details](deploy/README.md).
 
+## Code tour (if you're learning Rust)
+
+Read in this order — smallest first, each file says what it teaches:
+
+1. `backend-rove/src/lib.rs` — SSE decoder + shared budget consts. Ownership,
+   slices, `Result`/`?`, `if let`, unit tests. (~100 lines)
+2. `backend-rove/src/client.rs` — terminal UI loop. Async I/O, JSON matching,
+   threads + channels, Ctrl-C handling. (~200 lines)
+3. `backend-rove/src/server.rs` — HTTP relay, tool loop, hedged requests,
+   observer tap. Lifetimes, `Arc`/`Mutex`, channels, `select!`, builders.
+4. `backend-rove/Cargo.toml` — every dependency has a comment saying why it exists.
+5. `deploy/test-chat.py` — how the whole system is tested with a fake OpenAI.
+
 Official API references: [streaming](https://developers.openai.com/api/docs/guides/streaming-responses),
 [reasoning summaries](https://developers.openai.com/api/docs/guides/reasoning#reasoning-summaries).

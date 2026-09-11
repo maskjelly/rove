@@ -1,4 +1,12 @@
-"""End-to-end tests use a local OpenAI mock; no credentials or API spend."""
+"""End-to-end tests use a local OpenAI mock; no credentials or API spend.
+
+How it works: a fake OpenAI server (Mock) streams canned SSE events, the real
+`server` binary is pointed at it via OPENAI_BASE_URL, and the real `client`
+binary chats through it. Scenarios: normal answers, history, /new reset,
+quota errors, disconnects, invalid input, Ctrl-C, a run_command tool
+round-trip, a stalled first byte (hedge must fire a twin), and observer tap.
+Usage: python3 deploy/test-chat.py <server-bin> <client-bin> (from backend-rove/).
+"""
 import json
 import os
 import signal
