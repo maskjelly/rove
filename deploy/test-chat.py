@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 requests = []
 tool_calls = []
+slow_hits = []
 
 class Mock(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -58,6 +59,11 @@ class Mock(BaseHTTPRequestHandler):
                 {'type': 'message', 'id': 'msg_1', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Checking. '}]},
                 {'type': 'function_call', 'id': 'fc_1', 'call_id': 'call_1', 'name': 'run_command', 'arguments': '{' + chr(34) + 'command' + chr(34) + ': ' + chr(34) + 'echo tool-ok' + chr(34) + '}'}]}})
             return
+        if prompt == 'slow':
+            slow_hits.append(1)
+            if len(slow_hits) == 1:
+                time.sleep(1.0)
+                # Server should have hedged by now and dropped this connection.
         if prompt == 'quota':
             self.send_response(429)
             self.end_headers()
@@ -69,9 +75,12 @@ class Mock(BaseHTTPRequestHandler):
         def emit(value):
             data = ('data: ' + json.dumps(value, ensure_ascii=False) + '\r\n\r\n').encode()
             # Force chunk boundaries through UTF-8 and SSE framing.
-            for start in range(0, len(data), 3):
-                self.wfile.write(data[start:start+3])
+            try:
+                for start in range(0, len(data), 3):
+                    self.wfile.write(data[start:start+3])
                 self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
         emit({'type': 'response.created', 'response': {'model': 'mock-mini'}})
         emit({'type': 'response.reasoning_summary_text.delta', 'delta': 'A brief summary.'})
         emit({'type': 'response.output_text.delta', 'delta': 'hé🙂 '})
@@ -100,9 +109,9 @@ try:
             time.sleep(.05)
     else:
         raise RuntimeError('Server did not start')
-    client = subprocess.run([sys.argv[2], base], input='hello\nfollow up\n/new\nnew chat\nquota\ndisconnect\nruncmd\n/exit\n', text=True, capture_output=True, timeout=20)
+    client = subprocess.run([sys.argv[2], base], input='hello\nfollow up\n/new\nnew chat\nquota\ndisconnect\nruncmd\nslow\n/exit\n', text=True, capture_output=True, timeout=20)
     assert client.returncode == 0, client.stderr
-    assert client.stdout.count('hé🙂 world') == 3, client.stdout
+    assert client.stdout.count('hé🙂 world') == 4, client.stdout
     assert 'Reasoning summary' in client.stdout
     assert '10 input' in client.stdout
     assert len(requests[1]['input']) == 3, 'Follow-up must retain context'
@@ -115,6 +124,8 @@ try:
     assert chr(36) + ' echo tool-ok' in client.stdout, client.stdout
     assert 'Tool says: tool-ok' in client.stdout, client.stdout
     assert len(tool_calls) == 1 and tool_calls[0]['call_id'] == 'call_1', tool_calls
+    slow_reqs = [r for r in requests if isinstance(r['input'][-1], dict) and r['input'][-1].get('content') == 'slow']
+    assert len(slow_reqs) == 2, 'slow first byte must fire exactly one hedged twin'
     with urllib.request.urlopen(base + '/tap?tail=200', timeout=5) as response:
         tap = response.read().decode()
     assert 'runcmd' in tap and 'echo tool-ok' in tap and 'Tool says: tool-ok' in tap, tap
@@ -133,7 +144,7 @@ try:
     idle.send_signal(signal.SIGINT)
     idle.wait(timeout=3)
     idle.stdin.close()
-    print('PASS: summaries, split UTF-8, answers, history/reset, quota, disconnect, validation, idle cancellation, tool round-trip, observer tap')
+    print('PASS: summaries, split UTF-8, answers, history/reset, quota, disconnect, validation, idle cancellation, tool round-trip, observer tap, hedged slow start')
 finally:
     server.terminate()
     server.wait(timeout=5)

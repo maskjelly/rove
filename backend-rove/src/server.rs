@@ -295,6 +295,220 @@ fn sse_event(value: &Value) -> axum::body::Bytes {
     axum::body::Bytes::from(format!("data: {value}\n\n"))
 }
 
+/// First byte slower than this fires a hedged twin request; whichever
+/// responds first wins. Kills tail latency at ~2x cost on slow starts only.
+const HEDGE_DELAY_MS: u64 = 400;
+
+struct HeadStart {
+    response: reqwest::Response,
+    stash: VecDeque<axum::body::Bytes>,
+    hedged: bool,
+}
+
+fn stashed(
+    response: reqwest::Response,
+    first: Option<axum::body::Bytes>,
+    hedged: bool,
+) -> HeadStart {
+    let mut stash = VecDeque::new();
+    if let Some(bytes) = first {
+        stash.push_back(bytes);
+    }
+    HeadStart {
+        response,
+        stash,
+        hedged,
+    }
+}
+
+/// Send with hedging across both stall phases: slow response headers AND
+/// slow first body byte each trigger a twin race after the hedge delay.
+/// Non-success statuses return immediately (a twin would fail identically).
+async fn hedge_send(
+    http: &reqwest::Client,
+    template: reqwest::Request,
+) -> Result<HeadStart, reqwest::Error> {
+    let mut twin_template = template.try_clone();
+    let mut primary_fut = Box::pin(http.execute(template));
+    // Phase 1: first response headers win.
+    let mut primary = tokio::select! {
+        biased;
+        result = &mut primary_fut => result?,
+        _ = tokio::time::sleep(Duration::from_millis(HEDGE_DELAY_MS)), if twin_template.is_some() => {
+            let request = twin_template.take().unwrap_or_else(|| unreachable!("guarded by is_some"));
+            let mut twin_fut = Box::pin(http.execute(request));
+            tokio::select! {
+                result = &mut primary_fut => result?,
+                result = &mut twin_fut => result?,
+            }
+        }
+    };
+    if !primary.status().is_success() {
+        return Ok(stashed(primary, None, false));
+    }
+    // Phase 2: first body byte wins, if the twin is still unused.
+    if twin_template.is_none() {
+        return Ok(stashed(primary, None, true));
+    }
+    match tokio::time::timeout(Duration::from_millis(HEDGE_DELAY_MS), primary.chunk()).await {
+        Ok(Ok(Some(first))) => Ok(stashed(primary, Some(first), false)),
+        Ok(_) => Ok(stashed(primary, None, false)),
+        Err(_) => {
+            let request = twin_template
+                .take()
+                .unwrap_or_else(|| unreachable!("checked above"));
+            match tokio::time::timeout(Duration::from_secs(2), http.execute(request)).await {
+                Ok(Ok(secondary)) if secondary.status().is_success() => {
+                    let mut primary_first = Box::pin(first_chunk(primary));
+                    let mut twin_first = Box::pin(first_chunk(secondary));
+                    tokio::select! {
+                        (response, won) = &mut primary_first => match won {
+                            Ok(Some(bytes)) => Ok(stashed(response, Some(bytes), true)),
+                            _ => Ok(stashed(response, None, true)),
+                        },
+                        (response, won) = &mut twin_first => match won {
+                            Ok(Some(bytes)) => Ok(stashed(response, Some(bytes), true)),
+                            _ => Ok(stashed(response, None, true)),
+                        },
+                    }
+                }
+                _ => {
+                    let (response, won) = first_chunk(primary).await;
+                    match won {
+                        Ok(Some(bytes)) => Ok(stashed(response, Some(bytes), true)),
+                        _ => Ok(stashed(response, None, true)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Own the response, return it with its first-chunk outcome. Lets select!
+/// arms move winners while losers (response included) drop with their future.
+async fn first_chunk(
+    mut response: reqwest::Response,
+) -> (
+    reqwest::Response,
+    Result<Option<axum::body::Bytes>, reqwest::Error>,
+) {
+    let won = response.chunk().await;
+    (response, won)
+}
+
+/// Tap coalescing state for one upstream stream: fragments accumulate and
+/// flush as readable sentence lines instead of one line per word.
+struct TapFeed<'a> {
+    tap: &'a Tap,
+    answer: String,
+    reason: String,
+    first_text: bool,
+    received: std::time::Instant,
+}
+
+impl TapFeed<'_> {
+    fn feed(
+        &mut self,
+        decoder: &mut SseDecoder,
+        bytes: &axum::body::Bytes,
+        output_items: &mut Vec<Value>,
+        completed: &mut bool,
+    ) {
+        for data in decoder.push(bytes).unwrap_or_default() {
+            if data == "[DONE]" {
+                continue;
+            }
+            let Ok(value): Result<Value, _> = serde_json::from_str(&data) else {
+                continue;
+            };
+            match value.get("type").and_then(|t| t.as_str()) {
+                Some("response.output_text.delta" | "response.refusal.delta") => {
+                    if let Some(d) = value.get("delta").and_then(|d| d.as_str()) {
+                        if !self.first_text {
+                            self.first_text = true;
+                            self.tap.push(TapLine::now(format!(
+                                "· first answer +{}ms after receipt",
+                                self.received.elapsed().as_millis()
+                            )));
+                        }
+                        self.answer.push_str(d);
+                    }
+                    flush_tap_lines(self.tap, &mut self.answer, false);
+                }
+                Some("response.reasoning_summary_text.delta") => {
+                    if let Some(d) = value.get("delta").and_then(|d| d.as_str()) {
+                        self.reason.push_str(d);
+                    }
+                }
+                Some("response.reasoning_summary_text.done") => {
+                    let text = self.reason.trim().to_string();
+                    self.reason.clear();
+                    if !text.is_empty() {
+                        self.tap.push(TapLine::now(format!("~ {text}")));
+                    }
+                }
+                Some("response.completed") => {
+                    self.finish();
+                    if let Some(output) = value
+                        .get("response")
+                        .and_then(|r| r.get("output"))
+                        .and_then(|o| o.as_array())
+                    {
+                        *output_items = output.clone();
+                    }
+                    *completed = true;
+                    if let Some(usage) = value.get("response").and_then(|r| r.get("usage")) {
+                        self.tap.push(TapLine::now(format!(
+                            "✓ done · {} in / {} out · {}ms server",
+                            usage
+                                .get("input_tokens")
+                                .map(|v| v.to_string())
+                                .as_deref()
+                                .unwrap_or("?"),
+                            usage
+                                .get("output_tokens")
+                                .map(|v| v.to_string())
+                                .as_deref()
+                                .unwrap_or("?"),
+                            self.received.elapsed().as_millis()
+                        )));
+                    }
+                }
+                _ => {
+                    if let Some(line) = render_tap_event(&value)
+                        && !line.trim().is_empty()
+                    {
+                        self.tap.push(TapLine::now(format!("< {line}")));
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        flush_tap_lines(self.tap, &mut self.answer, true);
+        let reason = self.reason.trim().to_string();
+        self.reason.clear();
+        if !reason.is_empty() {
+            self.tap.push(TapLine::now(format!("~ {reason}")));
+        }
+    }
+}
+
+fn round_payload(model: &str, instructions: &str, input: &[Value], tools: &Value) -> Value {
+    json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "tools": tools,
+        "stream": true,
+        "store": false,
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "max_output_tokens": 2048,
+        "service_tier": "priority"
+    })
+}
+
 async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -> Response {
     let Some(key) = &state.key else {
         return error(
@@ -337,25 +551,28 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         .collect();
     let tools = json!([exec_tool_def()]);
     let instructions = "You are Rove, a terse assistant with a run_command tool for operating this server (30s limit). Probe read-only first. Be concise.";
-    let upstream = state
+    let payload = round_payload(&state.model, instructions, &input, &tools);
+    let template = match state
         .http
         .post(&state.endpoint)
         .bearer_auth(key)
-        .json(&json!({
-            "model": state.model,
-            "instructions": instructions,
-            "input": input,
-            "tools": tools,
-            "stream": true,
-            "store": false,
-            "reasoning": {"effort": "low", "summary": "auto"},
-            "max_output_tokens": 2048,
-            "service_tier": "priority"
-        }))
-        .send()
-        .await;
-    let upstream = match upstream {
-        Ok(response) => response,
+        .json(&payload)
+        .build()
+    {
+        Ok(template) => template,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "Cannot reach OpenAI. Please retry.",
+            );
+        }
+    };
+    let HeadStart {
+        response: upstream,
+        stash,
+        hedged: hedged_round0,
+    } = match hedge_send(&state.http, template).await {
+        Ok(hedged) => hedged,
         Err(_) => {
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -404,36 +621,38 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         // First round reuses the already-sent request above so its HTTP errors
         // keep their status codes; later rounds failed mid-stream become SSE
         // error events instead.
-        let mut pending: Option<reqwest::Response> = Some(upstream);
+        let mut pending: Option<HeadStart> = Some(HeadStart {
+            response: upstream,
+            stash,
+            hedged: hedged_round0,
+        });
         let mut turn_input = Vec::new();
         let mut round: u8 = 0;
         'rounds: loop {
-            let mut upstream = match pending.take() {
-                Some(response) => response,
+            let head = match pending.take() {
+                Some(head) => head,
                 None => {
                     if round >= MAX_TOOL_ROUNDS {
                         tap.push(TapLine::now("! stopped after 8 tool steps".into()));
                         yield Ok::<_, Infallible>(sse_error("Stopped after 8 tool steps. Ask in smaller pieces."));
                         break 'rounds;
                     }
-                    match http
+                    let payload = round_payload(&model, instructions, &turn_input, &tools);
+                    let template = match http
                         .post(&endpoint)
                         .bearer_auth(&key)
-                        .json(&json!({
-                            "model": model,
-                            "instructions": instructions,
-                            "input": turn_input,
-                            "tools": tools,
-                            "stream": true,
-                            "store": false,
-                            "reasoning": {"effort": "low", "summary": "auto"},
-                            "max_output_tokens": 2048,
-            "service_tier": "priority"
-                        }))
-                        .send()
-                        .await
+                        .json(&payload)
+                        .build()
                     {
-                        Ok(response) if response.status().is_success() => response,
+                        Ok(template) => template,
+                        Err(_) => {
+                            tap.push(TapLine::now("! follow-up model request failed".into()));
+                            yield Ok::<_, Infallible>(sse_error("The model request failed. Please try again."));
+                            break 'rounds;
+                        }
+                    };
+                    match hedge_send(&http, template).await {
+                        Ok(head) if head.response.status().is_success() => head,
                         _ => {
                             tap.push(TapLine::now("! follow-up model request failed".into()));
                             yield Ok::<_, Infallible>(sse_error("The model request failed. Please try again."));
@@ -443,93 +662,35 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 }
             };
             round += 1;
+            let HeadStart {
+                response: mut upstream,
+                mut stash,
+                hedged,
+            } = head;
+            if hedged {
+                tap.push(TapLine::now("⇄ hedged retry fired".into()));
+            }
             let mut decoder = SseDecoder::default();
             let mut output_items: Vec<Value> = Vec::new();
             let mut completed = false;
-            // Tap coalescing: fragments accumulate here and flush as readable
-            // sentence lines instead of one line per word.
-            let mut tap_answer = String::new();
-            let mut tap_reason = String::new();
-            let mut first_text = false;
+            let mut feed = TapFeed {
+                tap: &tap,
+                answer: String::new(),
+                reason: String::new(),
+                first_text: false,
+                received,
+            };
+            while let Some(bytes) = stash.pop_front() {
+                feed.feed(&mut decoder, &bytes, &mut output_items, &mut completed);
+                yield Ok::<_, Infallible>(bytes);
+            }
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b": ping\n\n")),
                     chunk = upstream.chunk() => match chunk {
                         Ok(Some(bytes)) => {
                             // Control-plane peek + observer tee; wire bytes go out verbatim.
-                            for data in decoder.push(&bytes).unwrap_or_default() {
-                                if data == "[DONE]" {
-                                    continue;
-                                }
-                                let Ok(value): Result<Value, _> = serde_json::from_str(&data)
-                                else {
-                                    continue;
-                                };
-                                match value.get("type").and_then(|t| t.as_str()) {
-                                    Some(
-                                        "response.output_text.delta"
-                                        | "response.refusal.delta",
-                                    ) => {
-                                        if let Some(d) = value.get("delta").and_then(|d| d.as_str()) {
-                                            if !first_text {
-                                                first_text = true;
-                                                tap.push(TapLine::now(format!(
-                                                    "· first answer +{}ms after receipt",
-                                                    received.elapsed().as_millis()
-                                                )));
-                                            }
-                                            tap_answer.push_str(d);
-                                        }
-                                        flush_tap_lines(&tap, &mut tap_answer, false);
-                                    }
-                                    Some("response.reasoning_summary_text.delta") => {
-                                        if let Some(d) = value.get("delta").and_then(|d| d.as_str()) {
-                                            tap_reason.push_str(d);
-                                        }
-                                    }
-                                    Some("response.reasoning_summary_text.done") => {
-                                        let text = tap_reason.trim().to_string();
-                                        tap_reason.clear();
-                                        if !text.is_empty() {
-                                            tap.push(TapLine::now(format!("~ {text}")));
-                                        }
-                                    }
-                                    Some("response.completed") => {
-                                        flush_tap_lines(&tap, &mut tap_answer, true);
-                                        let reason = tap_reason.trim().to_string();
-                                        tap_reason.clear();
-                                        if !reason.is_empty() {
-                                            tap.push(TapLine::now(format!("~ {reason}")));
-                                        }
-                                        if let Some(output) = value
-                                            .get("response")
-                                            .and_then(|r| r.get("output"))
-                                            .and_then(|o| o.as_array())
-                                        {
-                                            output_items = output.clone();
-                                        }
-                                        completed = true;
-                                        if let Some(usage) = value
-                                            .get("response")
-                                            .and_then(|r| r.get("usage"))
-                                        {
-                                            tap.push(TapLine::now(format!(
-                                                "✓ done · {} in / {} out · {}ms server",
-                                                usage.get("input_tokens").map(|v| v.to_string()).as_deref().unwrap_or("?"),
-                                                usage.get("output_tokens").map(|v| v.to_string()).as_deref().unwrap_or("?"),
-                                                received.elapsed().as_millis()
-                                            )));
-                                        }
-                                    }
-                                    _ => {
-                                        if let Some(line) = render_tap_event(&value)
-                                            && !line.trim().is_empty()
-                                        {
-                                            tap.push(TapLine::now(format!("< {line}")));
-                                        }
-                                    }
-                                }
-                            }
+                            feed.feed(&mut decoder, &bytes, &mut output_items, &mut completed);
                             yield Ok(bytes);
                         }
                         Ok(None) => break,
@@ -541,6 +702,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                     },
                 }
             }
+            feed.finish();
             let calls: Vec<(String, String)> = output_items
                 .iter()
                 .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
