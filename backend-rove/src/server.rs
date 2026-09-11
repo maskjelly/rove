@@ -567,6 +567,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
             );
         }
     };
+    let hs_t0 = std::time::Instant::now();
     let HeadStart {
         response: upstream,
         stash,
@@ -580,6 +581,7 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
             );
         }
     };
+    let hs_waited0 = hs_t0.elapsed().as_millis() as u64;
     if !upstream.status().is_success() {
         let status = upstream.status().as_u16();
         // Do not forward upstream error bodies: authentication errors can include key fragments.
@@ -668,7 +670,9 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
                 hedged,
             } = head;
             if hedged {
-                tap.push(TapLine::now("⇄ hedged retry fired".into()));
+                tap.push(TapLine::now(format!(
+                    "⇄ hedged retry fired (+{hs_waited0}ms hedge)"
+                )));
             }
             let mut decoder = SseDecoder::default();
             let mut output_items: Vec<Value> = Vec::new();
