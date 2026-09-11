@@ -572,6 +572,14 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         .collect();
     let tools = json!([exec_tool_def()]);
     let instructions = "You are Rove, a terse assistant with a run_command tool for operating this server (30s limit). Probe read-only first. Be concise.";
+    // Stamp receipt BEFORE any upstream work: this is t=0 of the turn.
+    let tap = state.tap.clone();
+    if let Some(last) = request.messages.last() {
+        tap.push(format!(
+            "> {}",
+            last.content.chars().take(300).collect::<String>()
+        ));
+    }
     let payload = round_payload(&state.model, instructions, &input, &tools);
     let template = match state
         .http
@@ -620,17 +628,11 @@ async fn chat(State(state): State<AppState>, Json(request): Json<ChatRequest>) -
         return error(StatusCode::BAD_GATEWAY, message);
     }
     // The SSE stream must be 'static: hand it owned copies of everything.
+    // (`tap` was cloned above for the receipt stamp.)
     let http = state.http.clone();
     let endpoint = state.endpoint.clone();
     let model = state.model.clone();
     let key: String = key.clone();
-    let tap = state.tap.clone();
-    if let Some(last) = request.messages.last() {
-        tap.push(format!(
-            "> {}",
-            last.content.chars().take(300).collect::<String>()
-        ));
-    }
     let stream = async_stream::stream! {
         // Held until completion or client disconnect; dropping this stream closes upstream.
         let _permit = permit;
